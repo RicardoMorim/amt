@@ -11,6 +11,7 @@ from core.cvd import calculate_cvd
 from core.market_state import identify_market_state, check_false_breakout
 from signals.balance_breakout import detect_balance_breakout
 from signals.volume_imbalance import detect_aggression_spike, detect_cvd_divergence
+from signals.arbitration import SignalArbitrator
 from alerts.console import ConsoleAlert
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,6 +28,7 @@ class AMTSession:
         # Tools
         self.profile_mgr = SessionProfileManager(tick_size=tick_size, value_area_pct=0.68)
         self.alert = alert_dispatcher or ConsoleAlert()
+        self.arbitrator = SignalArbitrator()
         
         # State
         self.current_candle_start = None
@@ -81,40 +83,40 @@ class AMTSession:
             # Alpaca API for historical data (requires API keys and specific endpoint)
             # This is a placeholder. You would typically use Alpaca's SDK or direct REST calls.
             # Example:
-            # from alpaca.data.requests import StockBarsRequest
-            # from alpaca.data.timeframe import TimeFrame
-            # from alpaca.data.historical import StockHistoricalDataClient
-            #
-            # client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-            # request_params = StockBarsRequest(
-            #     symbol_or_symbols=[self.symbol],
-            #     timeframe=TimeFrame.Minute, # Adjust based on self.candle_timeframe_seconds
-            #     start=datetime.now() - timedelta(days=1),
-            #     end=datetime.now()
-            # )
-            # bars = client.get_stock_bars(request_params)
-            #
-            # preload = []
-            # for bar in bars.data[self.symbol]:
-            #     candle = {
-            #         'timestamp': bar.timestamp,
-            #         'open': bar.open,
-            #         'high': bar.high,
-            #         'low': bar.low,
-            #         'close': bar.close,
-            #         'volume': bar.volume,
-            #         'delta': 0 # Alpaca historical bars don't provide delta directly, needs approximation
-            #     }
-            #     preload.append(candle)
-            #
-            # if preload:
-            #     self.historical_candles = pd.DataFrame(preload).set_index('timestamp')
-            #     self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
-            #     for _, c in self.historical_candles.iloc[-20:].iterrows():
-            #         self.profile_mgr.update(price=c['close'], volume=c['volume'])
-            #     logging.info(f"[{self.symbol}] ✅ Histórico carregado. Motor pronto a disparar sinais!")
-            # else:
-            #     logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico da Alpaca: Sem dados.")
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            from alpaca.data.historical import StockHistoricalDataClient
+            
+            client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            request_params = StockBarsRequest(
+                symbol_or_symbols=[self.symbol],
+                timeframe=TimeFrame.Minute, # Adjust based on self.candle_timeframe_seconds
+                start=datetime.now() - timedelta(days=1),
+                end=datetime.now()
+            )
+            bars = client.get_stock_bars(request_params)
+            
+            preload = []
+            for bar in bars.data[self.symbol]:
+                candle = {
+                    'timestamp': bar.timestamp,
+                    'open': bar.open,
+                    'high': bar.high,
+                    'low': bar.low,
+                    'close': bar.close,
+                    'volume': bar.volume,
+                    'delta': 0 # Alpaca historical bars don't provide delta directly, needs approximation
+                }
+                preload.append(candle)
+            
+            if preload:
+                self.historical_candles = pd.DataFrame(preload).set_index('timestamp')
+                self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
+                for _, c in self.historical_candles.iloc[-20:].iterrows():
+                    self.profile_mgr.update(price=c['close'], volume=c['volume'])
+                logging.info(f"[{self.symbol}] ✅ Histórico carregado. Motor pronto a disparar sinais!")
+            else:
+                logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico da Alpaca: Sem dados.")
             logging.warning(f"[{self.symbol}] Pré-carregamento de histórico da Alpaca não implementado. A iniciar sem histórico.")
 
 
@@ -201,38 +203,88 @@ class AMTSession:
         latest_candle = self.historical_candles.iloc[-1].to_dict()
         cvd_data = self.historical_candles[['cvd', 'delta']]
         
-        # Signal 1: False Breakout (Look Above and Fail)
-        prices_list = self.historical_candles['close'].tolist()[-4:-1] # Prev 3 closes
-        false_breakout = check_false_breakout(latest_candle['close'], prices_list, profile_data)
-        if false_breakout:
-            self.alert.send(
-                signal_type=false_breakout['signal'], 
-                direction=false_breakout['direction'], 
-                trigger_price=latest_candle['close'],
-                asset=self.symbol,
-                target_poc=profile_data['poc']
-            )
+        # -- ML Context & Feature Generation --
+        trigger_price = latest_candle['close']
+        poc = profile_data['poc']
+        vah = profile_data['vah']
+        val = profile_data['val']
+        
+        session_state = identify_market_state(trigger_price, profile_data)
+        distance_to_poc = trigger_price - poc
+        distance_to_poc_pct = (distance_to_poc / poc) if poc > 0 else 0
+        
+        recent_vol = self.historical_candles['volume'].iloc[-21:-1]
+        vol_std = recent_vol.std()
+        volume_zscore = (latest_candle['volume'] - recent_vol.mean()) / (vol_std if vol_std > 0 else 1)
+        
+        recent_delta = self.historical_candles['delta'].iloc[-21:-1]
+        del_std = recent_delta.std()
+        delta_zscore = (latest_candle['delta'] - recent_delta.mean()) / (del_std if del_std > 0 else 1)
+        
+        cvd_slope_short = self.historical_candles['cvd'].iloc[-1] - self.historical_candles['cvd'].iloc[-5] if len(self.historical_candles) >= 5 else 0
+        cvd_slope_long = self.historical_candles['cvd'].iloc[-1] - self.historical_candles['cvd'].iloc[-60] if len(self.historical_candles) >= 60 else 0
+        
+        context = {
+            "candle_time": latest_candle['timestamp'].isoformat() + "Z",
+            "timeframe_secs": self.candle_timeframe_seconds,
+            "asset": self.symbol,
+            "trigger_price": trigger_price,
+            "close_price": trigger_price,
+            "session_id": latest_candle['timestamp'].strftime('%Y-%m-%d'),
+            "session_state": session_state,
+            "vah": vah,
+            "val": val,
+            "poc": poc,
+            "distance_to_poc": distance_to_poc,
+            "distance_to_poc_pct": round(distance_to_poc_pct, 5),
+            "volume": latest_candle['volume'],
+            "volume_zscore": round(volume_zscore, 2),
+            "delta": latest_candle['delta'],
+            "delta_zscore": round(delta_zscore, 2),
+            "cvd_current": latest_candle['cvd'],
+            "cvd_slope_short": cvd_slope_short,
+            "cvd_slope_long": cvd_slope_long,
+        }
+        
+        # -- Raw Signal Generation --
+        raw_signals = []
 
-        # Signal 2: Initiative Breakout with Volume Expansion
+        prices_list = self.historical_candles['close'].tolist()[-4:-1]
+        false_breakout = check_false_breakout(trigger_price, prices_list, profile_data)
+        if false_breakout: raw_signals.append(false_breakout)
+
         breakout = detect_balance_breakout(latest_candle, cvd_data, profile_data, self.historical_candles.iloc[-20:-1])
-        if breakout:
-            self.alert.send(asset=self.symbol, **breakout)
+        if breakout: raw_signals.append(breakout)
             
-        # Signal 3: Exhaustion / Divergence
         divergence = detect_cvd_divergence(self.historical_candles['close'], self.historical_candles['cvd'])
-        if divergence:
-            self.alert.send(asset=self.symbol, **divergence)
+        if divergence: raw_signals.append(divergence)
             
-        # Signal 4: Aggression Spike
         spike = detect_aggression_spike(self.historical_candles['delta'])
-        if spike:
-            self.alert.send(trigger_price=latest_candle['close'], asset=self.symbol, **spike)
+        if spike: raw_signals.append(spike)
+        
+        # -- Signal Arbitration & Dispatch --
+        if raw_signals:
+            try:
+                final_signal, all_jsons = self.arbitrator.arbitrate(raw_signals, context)
+                
+                # Phase 2 ML: Here we have "all_jsons" fully structured. We could save them to .parquet/.csv
+                
+                if final_signal:
+                    if final_signal['direction'] != 'CONFLICT':
+                        # Send clear signals to Discord/Telegram/Console
+                        self.alert.send(final_signal)
+                    else:
+                        # Log conflicts silently. E.g., Don't short if there's a huge DELTA_SPIKE long on the same candle!
+                        logging.warning(f"[{self.symbol}] ⚠️ Conflito de sinais evitado (Long vs Short) na mesma vela aos {trigger_price}")
+                        
+            except Exception as e:
+                logging.error(f"[{self.symbol}] Falha na Arbitragem de sinais: {e}")
 
 class AMTEngineManager:
     """
     Orchestrator that spins up multiple WebSockets and Sessions for different assets concurrently.
     """
-    def __init__(self):
+    def __init__(self,):
         self.alert = ConsoleAlert()
         self.sessions = {}
         self.collectors = []
