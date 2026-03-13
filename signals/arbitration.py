@@ -3,10 +3,10 @@ import datetime
 from typing import List, Dict, Tuple
 
 class SignalArbitrator:
-    \"\"\"
+    """
     Takes multiple raw signals generated in a single candle for the same asset
     and arbitrates them to prevent conflicting alerts and prepare ML datasets.
-    \"\"\"
+    """
     def __init__(self):
         # Optional weights if we want to determine direction heavily
         self.weights = {
@@ -17,9 +17,9 @@ class SignalArbitrator:
         }
 
     def _craft_json(self, raw_signal: dict, context: dict) -> dict:
-        \"\"\" Formats a raw signal dict into the ML-ready dataset structure \"\"\"
+        """ Formats a raw signal dict into the ML-ready dataset structure """
         signal = dict(context) # Copy base context metrics
-        now_str = datetime.datetime.utcnow().isoformat() + \"Z\"
+        now_str = datetime.datetime.utcnow().isoformat() + "Z"
         
         signal['id'] = str(uuid.uuid4())
         signal['timestamp_event'] = now_str
@@ -36,10 +36,10 @@ class SignalArbitrator:
         return signal
 
     def arbitrate(self, raw_signals: List[Dict], context: Dict) -> Tuple[Dict, List[Dict]]:
-        \"\"\"
+        """
         Returns:
             (composite_signal_dict, list_of_all_raw_json_signals)
-        \"\"\"
+        """
         all_jsons = [self._craft_json(rs, context) for rs in raw_signals]
         
         if not all_jsons:
@@ -56,7 +56,7 @@ class SignalArbitrator:
         
         composite = dict(context)
         composite['id'] = str(uuid.uuid4())
-        composite['timestamp_event'] = datetime.datetime.utcnow().isoformat() + \"Z\"
+        composite['timestamp_event'] = datetime.datetime.utcnow().isoformat() + "Z"
         composite['is_composite'] = True
         composite['component_signals'] = [
             {'signal_type': s['signal_type'], 'direction': s['direction'], 'weight': self.weights.get(s['signal_type'], 1.0)}
@@ -68,12 +68,12 @@ class SignalArbitrator:
             composite['direction'] = list(directions)[0]
             composite['signal_type'] = 'COMPOSITE_CONFLUENCE'
             composite['conflict'] = False
-            composite['meta'] = {'description': f\"Confluência de {len(all_jsons)} sinais.\"}
+            composite['meta'] = {'description': f"Confluência de {len(all_jsons)} sinais."}
         else:
             # Conflict detected!
             composite['direction'] = 'CONFLICT'
             composite['signal_type'] = 'COMPOSITE_CONFLICT'
             composite['conflict'] = True
-            composite['meta'] = {'description': f\"Sinais opostos detetados na mesma vela.\"}
+            composite['meta'] = {'description': f"Sinais opostos detetados na mesma vela."}
             
         return composite, all_jsons
