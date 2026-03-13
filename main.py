@@ -2,10 +2,9 @@ import asyncio
 import logging
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from data.collector_binance import BinanceDataCollector
-from data.collector_nq import AlpacaDataCollector
 from core.volume_profile import SessionProfileManager
 from core.cvd import calculate_cvd
 from core.market_state import identify_market_state, check_false_breakout
@@ -78,46 +77,6 @@ class AMTSession:
                 
             except Exception as e:
                 logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico: {e}")
-        elif self.source == 'alpaca':
-            logging.info(f"[{self.symbol}] ⏳ A carregar histórico da Alpaca para arranque imediato...")
-            # Alpaca API for historical data (requires API keys and specific endpoint)
-            # This is a placeholder. You would typically use Alpaca's SDK or direct REST calls.
-            # Example:
-            from alpaca.data.requests import StockBarsRequest
-            from alpaca.data.timeframe import TimeFrame
-            from alpaca.data.historical import StockHistoricalDataClient
-            
-            client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-            request_params = StockBarsRequest(
-                symbol_or_symbols=[self.symbol],
-                timeframe=TimeFrame.Minute, # Adjust based on self.candle_timeframe_seconds
-                start=datetime.now() - timedelta(days=1),
-                end=datetime.now()
-            )
-            bars = client.get_stock_bars(request_params)
-            
-            preload = []
-            for bar in bars.data[self.symbol]:
-                candle = {
-                    'timestamp': bar.timestamp,
-                    'open': bar.open,
-                    'high': bar.high,
-                    'low': bar.low,
-                    'close': bar.close,
-                    'volume': bar.volume,
-                    'delta': 0 # Alpaca historical bars don't provide delta directly, needs approximation
-                }
-                preload.append(candle)
-            
-            if preload:
-                self.historical_candles = pd.DataFrame(preload).set_index('timestamp')
-                self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
-                for _, c in self.historical_candles.iloc[-20:].iterrows():
-                    self.profile_mgr.update(price=c['close'], volume=c['volume'])
-                logging.info(f"[{self.symbol}] ✅ Histórico carregado. Motor pronto a disparar sinais!")
-            else:
-                logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico da Alpaca: Sem dados.")
-            logging.warning(f"[{self.symbol}] Pré-carregamento de histórico da Alpaca não implementado. A iniciar sem histórico.")
 
 
     def on_trade(self, trade):
@@ -201,6 +160,7 @@ class AMTSession:
             return
             
         latest_candle = self.historical_candles.iloc[-1].to_dict()
+        latest_candle['timestamp'] = self.historical_candles.index[-1]
         cvd_data = self.historical_candles[['cvd', 'delta']]
         
         # -- ML Context & Feature Generation --
@@ -295,16 +255,13 @@ class AMTEngineManager:
         collector = BinanceDataCollector(symbol=symbol, callback=session.on_trade)
         self.collectors.append(collector.start())
         
-    def add_alpaca_asset(self, symbol, timeframe_sec=60, tick_size=0.25):
-        session = AMTSession(symbol, 'alpaca', timeframe_sec, self.alert, tick_size)
-        self.sessions[symbol] = session
-        collector = AlpacaDataCollector(symbols=[symbol], callback=session.on_trade)
-        # Wrap Alpaca's synchronous start in an asyncio thread to not block Binance
-        self.collectors.append(asyncio.to_thread(collector.start))
 
     async def start_all(self):
         logging.info("🚀 Arranque do Matrix: A iniciar Engine Multiativos...")
-        await asyncio.gather(*self.collectors)
+        try:
+            await asyncio.gather(*self.collectors)
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     manager = AMTEngineManager()
@@ -315,10 +272,23 @@ if __name__ == "__main__":
     # Adicionar Ethereum
     manager.add_binance_asset(symbol="ethusdt", timeframe_sec=60, tick_size=0.01)
     
-    # Adicionar Nasdaq (via ETF QQQ no Alpaca - Cuidado: Requer chaves de API no .env)
-    # manager.add_alpaca_asset(symbol="QQQ", timeframe_sec=60, tick_size=0.01)
+    # Adicionar Solana em vez de QQQ (Binance é grátis e tem agressão real)
+    manager.add_binance_asset(symbol="solusdt", timeframe_sec=60, tick_size=0.01)
     
     try:
-        asyncio.run(manager.start_all())
+        # Run event loop safely across Python > 3.10
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        main_task = loop.create_task(manager.start_all())
+        loop.run_until_complete(main_task)
     except KeyboardInterrupt:
+        logging.info("\n🛑 Sinal de interrupção recebido. A fechar conexões...")
+        # Cancel all running tasks
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+        # Allow loop to process the cancellations
+        loop.run_until_complete(asyncio.sleep(0.1))
         logging.info("Pára motores.")
+    except RuntimeError as e:
+        if "Event loop is closed" not in str(e):
+            raise
