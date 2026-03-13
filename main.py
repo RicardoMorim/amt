@@ -39,13 +39,13 @@ class AMTSession:
     def _preload_history(self):
         """ Fetch recent candles from REST API so we don't have to wait 10 minutes """
         if self.source == 'binance':
-            logging.info(f\"[{self.symbol}] ⏳ A carregar histórico da Binance para arranque imediato...\")
+            logging.info(f"[{self.symbol}] ⏳ A carregar histórico da Binance para arranque imediato...")
             # Convert timeframe to binance format (e.g. 60s = '1m', 300s = '5m')
-            interval = f\"{int(self.candle_timeframe_seconds/60)}m\" if self.candle_timeframe_seconds >= 60 else \"1m\"
+            interval = f"{int(self.candle_timeframe_seconds/60)}m" if self.candle_timeframe_seconds >= 60 else "1m"
             
             try:
                 # Fetch last 30 candles
-                url = f\"https://fapi.binance.com/fapi/v1/klines?symbol={self.symbol.upper()}&interval={interval}&limit=50\"
+                url = f"https://fapi.binance.com/fapi/v1/klines?symbol={self.symbol.upper()}&interval={interval}&limit=50"
                 res = requests.get(url).json()
                 
                 preload = []
