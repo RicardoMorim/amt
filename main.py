@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import pandas as pd
+import requests
 from datetime import datetime, timedelta
 
 from data.collector_binance import BinanceDataCollector
+from data.collector_nq import AlpacaDataCollector
 from core.volume_profile import SessionProfileManager
 from core.cvd import calculate_cvd
 from core.market_state import identify_market_state, check_false_breakout
@@ -13,23 +15,109 @@ from alerts.console import ConsoleAlert
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class AMTEngine:
+class AMTSession:
     """
-    The Main Brain.
-    Ties the live data stream to the profile manager and checks for signals dynamically.
+    Manages the state and heuristics for a SINGLE asset.
     """
-    def __init__(self, symbol="btcusdt", candle_timeframe_seconds=60):
+    def __init__(self, symbol, source, candle_timeframe_seconds=60, alert_dispatcher=None, tick_size=0.5):
+        self.symbol = symbol
+        self.source = source # 'binance' ou 'alpaca'
+        self.candle_timeframe_seconds = candle_timeframe_seconds
+        
         # Tools
-        self.profile_mgr = SessionProfileManager(tick_size=0.5, value_area_pct=0.68)
-        self.alert = ConsoleAlert()
-        self.collector = BinanceDataCollector(symbol=symbol, callback=self.on_trade)
+        self.profile_mgr = SessionProfileManager(tick_size=tick_size, value_area_pct=0.68)
+        self.alert = alert_dispatcher or ConsoleAlert()
         
         # State
-        self.candle_timeframe_seconds = candle_timeframe_seconds
         self.current_candle_start = None
         self.candle_trades = []
         self.historical_candles = pd.DataFrame()
         
+        # Preload history if possible
+        self._preload_history()
+        
+    def _preload_history(self):
+        """ Fetch recent candles from REST API so we don't have to wait 10 minutes """
+        if self.source == 'binance':
+            logging.info(f\"[{self.symbol}] ⏳ A carregar histórico da Binance para arranque imediato...\")
+            # Convert timeframe to binance format (e.g. 60s = '1m', 300s = '5m')
+            interval = f\"{int(self.candle_timeframe_seconds/60)}m\" if self.candle_timeframe_seconds >= 60 else \"1m\"
+            
+            try:
+                # Fetch last 30 candles
+                url = f\"https://fapi.binance.com/fapi/v1/klines?symbol={self.symbol.upper()}&interval={interval}&limit=50\"
+                res = requests.get(url).json()
+                
+                preload = []
+                for k in res:
+                    # [Open time, Open, High, Low, Close, Volume, Close time, Quote asset volume, Number of trades, Taker buy base volume, Taker buy quote volume, Ignore]
+                    candle = {
+                        'timestamp': pd.to_datetime(k[0], unit='ms'),
+                        'open': float(k[1]),
+                        'high': float(k[2]),
+                        'low': float(k[3]),
+                        'close': float(k[4]),
+                        'volume': float(k[5]),
+                        # Approximation of Delta for historic klines: (Taker Buy Volume - Taker Sell Volume)
+                        # Where Taker Sell Vol = Total Vol - Taker Buy Vol
+                        'delta': float(k[9]) - (float(k[5]) - float(k[9]))
+                    }
+                    preload.append(candle)
+                
+                self.historical_candles = pd.DataFrame(preload).set_index('timestamp')
+                self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
+                
+                # Preload the Profile Manager with the last 20 candles of volume at the POC/Close
+                # (Rough approximation for the session profile just to jumpstart it)
+                for _, c in self.historical_candles.iloc[-20:].iterrows():
+                    self.profile_mgr.update(price=c['close'], volume=c['volume'])
+                    
+                logging.info(f"[{self.symbol}] ✅ Histórico carregado. Motor pronto a disparar sinais!")
+                
+            except Exception as e:
+                logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico: {e}")
+        elif self.source == 'alpaca':
+            logging.info(f"[{self.symbol}] ⏳ A carregar histórico da Alpaca para arranque imediato...")
+            # Alpaca API for historical data (requires API keys and specific endpoint)
+            # This is a placeholder. You would typically use Alpaca's SDK or direct REST calls.
+            # Example:
+            # from alpaca.data.requests import StockBarsRequest
+            # from alpaca.data.timeframe import TimeFrame
+            # from alpaca.data.historical import StockHistoricalDataClient
+            #
+            # client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            # request_params = StockBarsRequest(
+            #     symbol_or_symbols=[self.symbol],
+            #     timeframe=TimeFrame.Minute, # Adjust based on self.candle_timeframe_seconds
+            #     start=datetime.now() - timedelta(days=1),
+            #     end=datetime.now()
+            # )
+            # bars = client.get_stock_bars(request_params)
+            #
+            # preload = []
+            # for bar in bars.data[self.symbol]:
+            #     candle = {
+            #         'timestamp': bar.timestamp,
+            #         'open': bar.open,
+            #         'high': bar.high,
+            #         'low': bar.low,
+            #         'close': bar.close,
+            #         'volume': bar.volume,
+            #         'delta': 0 # Alpaca historical bars don't provide delta directly, needs approximation
+            #     }
+            #     preload.append(candle)
+            #
+            # if preload:
+            #     self.historical_candles = pd.DataFrame(preload).set_index('timestamp')
+            #     self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
+            #     for _, c in self.historical_candles.iloc[-20:].iterrows():
+            #         self.profile_mgr.update(price=c['close'], volume=c['volume'])
+            #     logging.info(f"[{self.symbol}] ✅ Histórico carregado. Motor pronto a disparar sinais!")
+            # else:
+            #     logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico da Alpaca: Sem dados.")
+            logging.warning(f"[{self.symbol}] Pré-carregamento de histórico da Alpaca não implementado. A iniciar sem histórico.")
+
+
     def on_trade(self, trade):
         """ Callback fired on every single trade coming from WebSockets """
         
@@ -41,7 +129,7 @@ class AMTEngine:
         
         if self.current_candle_start is None:
             self.current_candle_start = trade_time.replace(microsecond=0)
-            logging.info(f"🟢 Primeira trade detetada. A iniciar construção da vela ({self.candle_timeframe_seconds}s) às {self.current_candle_start}...")
+            logging.info(f"[{self.symbol}] 🟢 A iniciar construção de vela ({self.candle_timeframe_seconds}s) às {self.current_candle_start}...")
             
         time_elapsed = (trade_time - self.current_candle_start).total_seconds()
         
@@ -60,7 +148,14 @@ class AMTEngine:
         df_trades = pd.DataFrame(self.candle_trades)
         
         # Calculate Delta directly from trades (accurate)
-        df_trades['delta'] = df_trades.apply(lambda x: x['volume'] if x['side'] == 'buy' else -x['volume'], axis=1)
+        if 'side' in df_trades.columns and df_trades['side'].notna().all():
+            df_trades['delta'] = df_trades.apply(lambda x: x['volume'] if x['side'] == 'buy' else -x['volume'], axis=1)
+        else:
+            # Fallback (Tick Test) for Alpaca/Stocks
+            price_diff = df_trades['price'].diff()
+            direction = price_diff.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0)).replace(0, pd.NA).ffill().fillna(1)
+            df_trades['delta'] = df_trades['volume'] * direction
+            
         candle_delta = df_trades['delta'].sum()
         
         # Build OHLCV Candle
@@ -82,7 +177,7 @@ class AMTEngine:
         if len(self.historical_candles) > 100:
             self.historical_candles = self.historical_candles.iloc[-100:]
             
-        logging.info(f"🔒 Vela Fechada [{candle['timestamp']}] | Close: {candle['close']} | Vol: {candle['volume']:.2f} | Delta: {candle['delta']:.2f}")
+        logging.info(f"[{self.symbol}] 🔒 Vela Fechada [{candle['timestamp']}] | Close: {candle['close']} | Vol: {candle['volume']:.2f} | Delta: {candle['delta']:.2f}")
         
         # Clear trades for the next candle
         self.candle_trades.clear()
@@ -96,7 +191,7 @@ class AMTEngine:
     def _analyze_market(self):
         """ Evaluates current state against AMT Rules """
         if len(self.historical_candles) < 10:
-            logging.info(f"⏳ A compilar histórico base... ({len(self.historical_candles)}/10 velas completas)")
+            logging.info(f"[{self.symbol}] ⏳ A compilar histórico base... ({len(self.historical_candles)}/10 velas completas)")
             return # Need some history
             
         profile_data = self.profile_mgr.get_levels()
@@ -114,31 +209,64 @@ class AMTEngine:
                 signal_type=false_breakout['signal'], 
                 direction=false_breakout['direction'], 
                 trigger_price=latest_candle['close'],
+                asset=self.symbol,
                 target_poc=profile_data['poc']
             )
 
         # Signal 2: Initiative Breakout with Volume Expansion
         breakout = detect_balance_breakout(latest_candle, cvd_data, profile_data, self.historical_candles.iloc[-20:-1])
         if breakout:
-            self.alert.send(**breakout)
+            self.alert.send(asset=self.symbol, **breakout)
             
         # Signal 3: Exhaustion / Divergence
         divergence = detect_cvd_divergence(self.historical_candles['close'], self.historical_candles['cvd'])
         if divergence:
-            self.alert.send(**divergence)
+            self.alert.send(asset=self.symbol, **divergence)
             
         # Signal 4: Aggression Spike
         spike = detect_aggression_spike(self.historical_candles['delta'])
         if spike:
-            self.alert.send(trigger_price=latest_candle['close'], **spike)
+            self.alert.send(trigger_price=latest_candle['close'], asset=self.symbol, **spike)
 
-    async def start(self):
-        logging.info("Initializing AMT Engine...")
-        try:
-            await self.collector.start()
-        except KeyboardInterrupt:
-            logging.info("Shutting down engine.")
+class AMTEngineManager:
+    """
+    Orchestrator that spins up multiple WebSockets and Sessions for different assets concurrently.
+    """
+    def __init__(self):
+        self.alert = ConsoleAlert()
+        self.sessions = {}
+        self.collectors = []
+        
+    def add_binance_asset(self, symbol, timeframe_sec=60, tick_size=0.5):
+        session = AMTSession(symbol, 'binance', timeframe_sec, self.alert, tick_size)
+        self.sessions[symbol] = session
+        collector = BinanceDataCollector(symbol=symbol, callback=session.on_trade)
+        self.collectors.append(collector.start())
+        
+    def add_alpaca_asset(self, symbol, timeframe_sec=60, tick_size=0.25):
+        session = AMTSession(symbol, 'alpaca', timeframe_sec, self.alert, tick_size)
+        self.sessions[symbol] = session
+        collector = AlpacaDataCollector(symbols=[symbol], callback=session.on_trade)
+        # Wrap Alpaca's synchronous start in an asyncio thread to not block Binance
+        self.collectors.append(asyncio.to_thread(collector.start))
+
+    async def start_all(self):
+        logging.info("🚀 Arranque do Matrix: A iniciar Engine Multiativos...")
+        await asyncio.gather(*self.collectors)
 
 if __name__ == "__main__":
-    engine = AMTEngine(symbol="btcusdt", candle_timeframe_seconds=60) # 1 Minute resolution for heuristics
-    asyncio.run(engine.start())
+    manager = AMTEngineManager()
+    
+    # Adicionar Bitcoin
+    manager.add_binance_asset(symbol="btcusdt", timeframe_sec=60, tick_size=0.1)
+    
+    # Adicionar Ethereum
+    manager.add_binance_asset(symbol="ethusdt", timeframe_sec=60, tick_size=0.01)
+    
+    # Adicionar Nasdaq (via ETF QQQ no Alpaca - Cuidado: Requer chaves de API no .env)
+    # manager.add_alpaca_asset(symbol="QQQ", timeframe_sec=60, tick_size=0.01)
+    
+    try:
+        asyncio.run(manager.start_all())
+    except KeyboardInterrupt:
+        logging.info("Pára motores.")
