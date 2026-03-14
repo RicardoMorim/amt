@@ -33,6 +33,7 @@ class AMTSession:
         self.current_candle_start = None
         self.candle_trades = []
         self.historical_candles = pd.DataFrame()
+        self.triggered_signals = set()
         
         # Preload history if possible
         self._preload_history()
@@ -78,7 +79,6 @@ class AMTSession:
             except Exception as e:
                 logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico: {e}")
 
-
     def on_trade(self, trade):
         """ Callback fired on every single trade coming from WebSockets """
         
@@ -101,12 +101,13 @@ class AMTSession:
             
         self.candle_trades.append(trade)
 
-    def _close_candle(self):
-        """ Aggregates trades into a 1m/5m candle and runs AMT Heuristics """
-        if not self.candle_trades:
-            return
-            
-        df_trades = pd.DataFrame(self.candle_trades)
+        # Real-time intra-candle analysis (every 10 trades to save CPU)
+        if len(self.candle_trades) > 0 and len(self.candle_trades) % 10 == 0:
+            live_candle = self._build_candle(self.candle_trades, self.current_candle_start)
+            self._analyze_market(live_candle, is_closed=False)
+
+    def _build_candle(self, trades, start_time):
+        df_trades = pd.DataFrame(trades)
         
         # Calculate Delta directly from trades (accurate)
         if 'side' in df_trades.columns and df_trades['side'].notna().all():
@@ -119,16 +120,28 @@ class AMTSession:
             
         candle_delta = df_trades['delta'].sum()
         
+        # Calculate real-time cumulative CVD for the unclosed candle
+        last_cvd = self.historical_candles['cvd'].iloc[-1] if not self.historical_candles.empty and 'cvd' in self.historical_candles.columns else 0
+        current_cvd = last_cvd + candle_delta
+        
         # Build OHLCV Candle
-        candle = {
-            'timestamp': self.current_candle_start,
+        return {
+            'timestamp': start_time,
             'open': df_trades['price'].iloc[0],
             'high': df_trades['price'].max(),
             'low': df_trades['price'].min(),
             'close': df_trades['price'].iloc[-1],
             'volume': df_trades['volume'].sum(),
-            'delta': candle_delta
+            'delta': candle_delta,
+            'cvd': current_cvd
         }
+
+    def _close_candle(self):
+        """ Aggregates trades into a 1m/5m candle and runs AMT Heuristics """
+        if not self.candle_trades:
+            return
+            
+        candle = self._build_candle(self.candle_trades, self.current_candle_start)
         
         # Append to History
         new_row = pd.DataFrame([candle]).set_index('timestamp')
@@ -147,21 +160,28 @@ class AMTSession:
         self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
         
         # ============== RUN HEURISTICS ==============
-        self._analyze_market()
+        self._analyze_market(candle, is_closed=True)
+        self.triggered_signals.clear() # Reset anti-spam for next candle
 
-    def _analyze_market(self):
+    def _analyze_market(self, latest_candle, is_closed=False):
         """ Evaluates current state against AMT Rules """
         if len(self.historical_candles) < 10:
-            logging.info(f"[{self.symbol}] ⏳ A compilar histórico base... ({len(self.historical_candles)}/10 velas completas)")
+            if is_closed:
+                logging.info(f"[{self.symbol}] ⏳ A compilar histórico base... ({len(self.historical_candles)}/10 velas completas)")
             return # Need some history
             
         profile_data = self.profile_mgr.get_levels()
         if not profile_data:
             return
             
-        latest_candle = self.historical_candles.iloc[-1].to_dict()
-        latest_candle['timestamp'] = self.historical_candles.index[-1]
-        cvd_data = self.historical_candles[['cvd', 'delta']]
+        if not is_closed:
+            new_row = pd.DataFrame([latest_candle]).set_index('timestamp')
+            working_history = pd.concat([self.historical_candles, new_row])
+            working_history['cvd'] = working_history['delta'].cumsum()
+        else:
+            working_history = self.historical_candles
+            
+        cvd_data = working_history[['cvd', 'delta']]
         
         # -- ML Context & Feature Generation --
         trigger_price = latest_candle['close']
@@ -173,16 +193,17 @@ class AMTSession:
         distance_to_poc = trigger_price - poc
         distance_to_poc_pct = (distance_to_poc / poc) if poc > 0 else 0
         
-        recent_vol = self.historical_candles['volume'].iloc[-21:-1]
+        # For Z-Scores, we don't want the live candle to skew the reference standard dev, so use closed history
+        recent_vol = self.historical_candles['volume'].iloc[-20:]
         vol_std = recent_vol.std()
         volume_zscore = (latest_candle['volume'] - recent_vol.mean()) / (vol_std if vol_std > 0 else 1)
         
-        recent_delta = self.historical_candles['delta'].iloc[-21:-1]
+        recent_delta = self.historical_candles['delta'].iloc[-20:]
         del_std = recent_delta.std()
         delta_zscore = (latest_candle['delta'] - recent_delta.mean()) / (del_std if del_std > 0 else 1)
         
-        cvd_slope_short = self.historical_candles['cvd'].iloc[-1] - self.historical_candles['cvd'].iloc[-5] if len(self.historical_candles) >= 5 else 0
-        cvd_slope_long = self.historical_candles['cvd'].iloc[-1] - self.historical_candles['cvd'].iloc[-60] if len(self.historical_candles) >= 60 else 0
+        cvd_slope_short = working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-5] if len(working_history) >= 5 else 0
+        cvd_slope_long = working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-60] if len(working_history) >= 60 else 0
         
         context = {
             "candle_time": latest_candle['timestamp'].isoformat() + "Z",
@@ -209,17 +230,17 @@ class AMTSession:
         # -- Raw Signal Generation --
         raw_signals = []
 
-        prices_list = self.historical_candles['close'].tolist()[-4:-1]
+        prices_list = working_history['close'].tolist()[-4:-1]
         false_breakout = check_false_breakout(trigger_price, prices_list, profile_data)
         if false_breakout: raw_signals.append(false_breakout)
 
-        breakout = detect_balance_breakout(latest_candle, cvd_data, profile_data, self.historical_candles.iloc[-20:-1])
+        breakout = detect_balance_breakout(latest_candle, cvd_data, profile_data, working_history.iloc[-20:-1])
         if breakout: raw_signals.append(breakout)
             
-        divergence = detect_cvd_divergence(self.historical_candles['close'], self.historical_candles['cvd'])
+        divergence = detect_cvd_divergence(working_history['close'], working_history['cvd'])
         if divergence: raw_signals.append(divergence)
             
-        spike = detect_aggression_spike(self.historical_candles['delta'])
+        spike = detect_aggression_spike(working_history['delta'])
         if spike: raw_signals.append(spike)
         
         # -- Signal Arbitration & Dispatch --
@@ -231,11 +252,19 @@ class AMTSession:
                 
                 if final_signal:
                     if final_signal['direction'] != 'CONFLICT':
-                        # Send clear signals to Discord/Telegram/Console
-                        self.alert.send(final_signal)
+                        # Anti-spam mechanism
+                        sig_key = f"{final_signal['signal_type']}_{final_signal['direction']}"
+                        if sig_key not in self.triggered_signals:
+                            self.triggered_signals.add(sig_key)
+                            
+                            if not is_closed:
+                                final_signal['meta']['is_live_intra_candle'] = True
+                                final_signal['meta']['description'] = "(!) LIVE INTRA-CANDLE ALERT: " + str(final_signal['meta'].get('description', ''))
+                                
+                            self.alert.send(final_signal)
                     else:
-                        # Log conflicts silently. E.g., Don't short if there's a huge DELTA_SPIKE long on the same candle!
-                        logging.warning(f"[{self.symbol}] ⚠️ Conflito de sinais evitado (Long vs Short) na mesma vela aos {trigger_price}")
+                        if is_closed:
+                            logging.warning(f"[{self.symbol}] ⚠️ Conflito de sinais evitado (Long vs Short) na mesma vela aos {trigger_price}")
                         
             except Exception as e:
                 logging.error(f"[{self.symbol}] Falha na Arbitragem de sinais: {e}")
@@ -244,7 +273,7 @@ class AMTEngineManager:
     """
     Orchestrator that spins up multiple WebSockets and Sessions for different assets concurrently.
     """
-    def __init__(self,):
+    def __init__(self):
         self.alert = ConsoleAlert()
         self.sessions = {}
         self.collectors = []
@@ -272,9 +301,6 @@ if __name__ == "__main__":
     # Adicionar Ethereum
     manager.add_binance_asset(symbol="ethusdt", timeframe_sec=60, tick_size=0.01)
     
-    # Adicionar Solana em vez de QQQ (Binance é grátis e tem agressão real)
-    manager.add_binance_asset(symbol="solusdt", timeframe_sec=60, tick_size=0.01)
-    
     try:
         # Run event loop safely across Python > 3.10
         loop = asyncio.new_event_loop()
@@ -282,7 +308,7 @@ if __name__ == "__main__":
         main_task = loop.create_task(manager.start_all())
         loop.run_until_complete(main_task)
     except KeyboardInterrupt:
-        logging.info("\n🛑 Sinal de interrupção recebido. A fechar conexões...")
+        logging.info("\\n🛑 Sinal de interrupção recebido. A fechar conexões...")
         # Cancel all running tasks
         for task in asyncio.all_tasks(loop):
             task.cancel()
