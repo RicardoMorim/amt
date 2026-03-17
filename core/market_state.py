@@ -40,19 +40,21 @@ def check_false_breakout(current_price, previous_prices, profile_data, cvd_data=
     Returns:
         dict with 'signal' and 'direction' if a false breakout is detected, else None.
     """
-    if not profile_data or len(previous_prices) < 2:
+    if not profile_data or len(previous_prices) < 1:
         return None
         
     vah = profile_data['vah']
     val = profile_data['val']
     
-    was_above_vah = any(p > vah for p in previous_prices)
+    prev_price = previous_prices[-1]
+    
+    was_above_vah = prev_price > vah
     is_below_vah = current_price < vah
     
     if was_above_vah and is_below_vah:
         return {'signal_type': 'FALSE_BREAKOUT', 'direction': 'SHORT', 'target': profile_data['poc']}
         
-    was_below_val = any(p < val for p in previous_prices)
+    was_below_val = prev_price < val
     is_above_val = current_price > val
     
     if was_below_val and is_above_val:

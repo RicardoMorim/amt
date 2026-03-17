@@ -250,21 +250,15 @@ class AMTSession:
                 
                 # Phase 2 ML: Here we have "all_jsons" fully structured. We could save them to .parquet/.csv
                 
-                if final_signal:
+                if final_signal and is_closed:
                     if final_signal['direction'] != 'CONFLICT':
                         # Anti-spam mechanism
                         sig_key = f"{final_signal['signal_type']}_{final_signal['direction']}"
                         if sig_key not in self.triggered_signals:
                             self.triggered_signals.add(sig_key)
-                            
-                            if not is_closed:
-                                final_signal['meta']['is_live_intra_candle'] = True
-                                final_signal['meta']['description'] = "(!) LIVE INTRA-CANDLE ALERT: " + str(final_signal['meta'].get('description', ''))
-                                
                             self.alert.send(final_signal)
                     else:
-                        if is_closed:
-                            logging.warning(f"[{self.symbol}] ⚠️ Conflito de sinais evitado (Long vs Short) na mesma vela aos {trigger_price}")
+                        logging.warning(f"[{self.symbol}] \u26a0\ufe0f Conflito de sinais evitado (Long vs Short) na mesma vela aos {trigger_price}")
                         
             except Exception as e:
                 logging.error(f"[{self.symbol}] Falha na Arbitragem de sinais: {e}")

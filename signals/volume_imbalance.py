@@ -14,18 +14,18 @@ def detect_cvd_divergence(price_series, cvd_series, window=5):
     Returns:
         dict describing the signal if valid, else None.
     """
-    if len(price_series) < window * 2:
+    if len(price_series) < window + 2:
         return None
         
     current_price = price_series.iloc[-1]
     current_cvd = cvd_series.iloc[-1]
     
     # Simple pivot logic via rolling max/min
-    recent_high_price = price_series.iloc[-(window*2):-window].max()
-    recent_low_price = price_series.iloc[-(window*2):-window].min()
+    recent_high_price = price_series.iloc[-(window+1):-1].max()
+    recent_low_price = price_series.iloc[-(window+1):-1].min()
     
-    recent_high_cvd = cvd_series.iloc[-(window*2):-window].max()
-    recent_low_cvd = cvd_series.iloc[-(window*2):-window].min()
+    recent_high_cvd = cvd_series.iloc[-(window+1):-1].max()
+    recent_low_cvd = cvd_series.iloc[-(window+1):-1].min()
     
     # BEARISH DIVERGENCE (Exhaustion of buyers)
     # Price makes higher high, but CVD is failing to make higher highs (Limit Selling Absorption)
