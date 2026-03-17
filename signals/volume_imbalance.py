@@ -20,16 +20,22 @@ def detect_cvd_divergence(price_series, cvd_series, window=5):
     current_price = price_series.iloc[-1]
     current_cvd = cvd_series.iloc[-1]
     
-    # Simple pivot logic via rolling max/min
-    recent_high_price = price_series.iloc[-(window+1):-1].max()
-    recent_low_price = price_series.iloc[-(window+1):-1].min()
+    # Need at least a minimal slope to consider it a real push
+    min_price_move_pct = 0.0005 # 0.05% move
     
-    recent_high_cvd = cvd_series.iloc[-(window+1):-1].max()
-    recent_low_cvd = cvd_series.iloc[-(window+1):-1].min()
+    # Better pivot logic: look at the actual swing high/low in the window
+    recent_prices = price_series.iloc[-(window+1):-1]
+    recent_cvds = cvd_series.iloc[-(window+1):-1]
+    
+    recent_high_price = recent_prices.max()
+    recent_low_price = recent_prices.min()
+    
+    recent_high_cvd = recent_cvds.max()
+    recent_low_cvd = recent_cvds.min()
     
     # BEARISH DIVERGENCE (Exhaustion of buyers)
-    # Price makes higher high, but CVD is failing to make higher highs (Limit Selling Absorption)
-    if current_price > recent_high_price and current_cvd < recent_high_cvd:
+    # Price makes higher high (meaningful push), but CVD makes lower high
+    if (current_price > recent_high_price * (1 + min_price_move_pct)) and (current_cvd < recent_high_cvd):
         return {
             'signal_type': 'CVD_DIVERGENCE_EXHAUSTION',
             'direction': 'SHORT',
@@ -38,8 +44,8 @@ def detect_cvd_divergence(price_series, cvd_series, window=5):
         }
         
     # BULLISH DIVERGENCE (Exhaustion of sellers)
-    # Price makes lower low, but CVD is failing to make lower lows (Limit Buying Absorption)
-    if current_price < recent_low_price and current_cvd > recent_low_cvd:
+    # Price makes lower low (meaningful push), but CVD makes higher low
+    if (current_price < recent_low_price * (1 - min_price_move_pct)) and (current_cvd > recent_low_cvd):
         return {
             'signal_type': 'CVD_DIVERGENCE_EXHAUSTION',
             'direction': 'LONG',
