@@ -101,25 +101,36 @@ class AMTSession:
             
         self.candle_trades.append(trade)
 
-        # Real-time intra-candle analysis (every 10 trades to save CPU)
-        if len(self.candle_trades) > 0 and len(self.candle_trades) % 10 == 0:
+        # Real-time intra-candle analysis (every 50 trades to save CPU)
+        if len(self.candle_trades) > 0 and len(self.candle_trades) % 50 == 0:
             live_candle = self._build_candle(self.candle_trades, self.current_candle_start)
             self._analyze_market(live_candle, is_closed=False)
 
     def _build_candle(self, trades, start_time):
-        df_trades = pd.DataFrame(trades)
+        if not trades: return None
         
-        # Calculate Delta directly from trades (accurate)
-        if 'side' in df_trades.columns and df_trades['side'].notna().all():
-            df_trades['delta'] = df_trades.apply(lambda x: x['volume'] if x['side'] == 'buy' else -x['volume'], axis=1)
+        open_price = trades[0]['price']
+        high_price = max(t['price'] for t in trades)
+        low_price = min(t['price'] for t in trades)
+        close_price = trades[-1]['price']
+        volume = sum(t['volume'] for t in trades)
+        
+        # Calculate Delta directly from trades (accurate & fast)
+        if 'side' in trades[0] and trades[0]['side'] is not None:
+            candle_delta = sum(t['volume'] if t['side'] == 'buy' else -t['volume'] for t in trades)
         else:
             # Fallback (Tick Test) for Alpaca/Stocks
-            price_diff = df_trades['price'].diff()
-            direction = price_diff.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0)).replace(0, pd.NA).ffill().fillna(1)
-            df_trades['delta'] = df_trades['volume'] * direction
-            
-        candle_delta = df_trades['delta'].sum()
-        
+            candle_delta = 0
+            last_price = open_price
+            last_direction = 1
+            for t in trades:
+                if t['price'] > last_price:
+                    last_direction = 1
+                elif t['price'] < last_price:
+                    last_direction = -1
+                candle_delta += t['volume'] * last_direction
+                last_price = t['price']
+                
         # Calculate real-time cumulative CVD for the unclosed candle
         last_cvd = self.historical_candles['cvd'].iloc[-1] if not self.historical_candles.empty and 'cvd' in self.historical_candles.columns else 0
         current_cvd = last_cvd + candle_delta
@@ -127,11 +138,11 @@ class AMTSession:
         # Build OHLCV Candle
         return {
             'timestamp': start_time,
-            'open': df_trades['price'].iloc[0],
-            'high': df_trades['price'].max(),
-            'low': df_trades['price'].min(),
-            'close': df_trades['price'].iloc[-1],
-            'volume': df_trades['volume'].sum(),
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': close_price,
+            'volume': volume,
             'delta': candle_delta,
             'cvd': current_cvd
         }
@@ -289,11 +300,8 @@ class AMTEngineManager:
 if __name__ == "__main__":
     manager = AMTEngineManager()
     
-    # Adicionar Bitcoin
+    # Adicionar Bitcoin (Foco Principal)
     manager.add_binance_asset(symbol="btcusdt", timeframe_sec=60, tick_size=0.1)
-    
-    # Adicionar Ethereum
-    manager.add_binance_asset(symbol="ethusdt", timeframe_sec=60, tick_size=0.01)
     
     try:
         # Run event loop safely across Python > 3.10
