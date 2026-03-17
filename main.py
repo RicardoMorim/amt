@@ -300,8 +300,8 @@ class AMTEngineManager:
 if __name__ == "__main__":
     manager = AMTEngineManager()
     
-    # Adicionar Bitcoin (Foco Principal)
-    manager.add_binance_asset(symbol="btcusdt", timeframe_sec=60, tick_size=0.1)
+    # Adicionar Bitcoin (Foco Principal) - 15 minutos de timeframe
+    manager.add_binance_asset(symbol="btcusdt", timeframe_sec=900, tick_size=0.1)
     
     try:
         # Run event loop safely across Python > 3.10
