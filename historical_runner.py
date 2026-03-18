@@ -90,19 +90,20 @@ class EmptyAlertSender:
         pass
 
 
-def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3) -> pd.DataFrame:
+def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3, aggregate_secs: int = 1) -> pd.DataFrame:
     """
     Synchronous function that downloads and parses a single day's zip from Binance Vision.
     Includes retry logic for transient network failures.
-    This is run inside a ThreadPoolExecutor to allow parallel downloads.
     
     Args:
         symbol: Trading pair (e.g., 'btcusdt')
         date_str: Date string (e.g., '2024-01-15')
         max_retries: Number of retry attempts for failed downloads
+        aggregate_secs: Aggregate ticks to N-second candles (default 1 = per second)
+                       Set to 0 to keep tick-by-tick (slower, more data)
         
     Returns:
-        DataFrame with columns: timestamp, price, volume, side
+        DataFrame with columns: timestamp, price, volume, side (aggregated if aggregate_secs > 0)
     """
     url = (
         f"https://data.binance.vision/data/futures/um/daily/trades/"
@@ -140,7 +141,13 @@ def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3) -> pd.D
             )
             df['price'] = pd.to_numeric(df['price'])
             df['volume'] = pd.to_numeric(df['qty'])
-            return df[['timestamp', 'price', 'volume', 'side']].dropna()
+            df = df[['timestamp', 'price', 'volume', 'side']].dropna()
+            
+            # ── AGGREGATION: Optional time-based bucketing to reduce noise ──────────
+            if aggregate_secs > 0:
+                df = _aggregate_by_seconds(df, aggregate_secs)
+            
+            return df
 
         except (requests.RequestException, zipfile.BadZipFile, Exception) as e:
             if attempt < max_retries - 1:
@@ -151,6 +158,46 @@ def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3) -> pd.D
                 return pd.DataFrame()
     
     return pd.DataFrame()
+
+
+def _aggregate_by_seconds(df: pd.DataFrame, secs: int) -> pd.DataFrame:
+    """
+    Aggregate tick-by-tick trades into N-second buckets using VWAP for price.
+    
+    Args:
+        df: DataFrame with columns [timestamp, price, volume, side]
+        secs: Bucket size in seconds
+        
+    Returns:
+        DataFrame with aggregated trades (one row per bucket)
+    """
+    if df.empty:
+        return df
+    
+    # Round timestamps down to nearest N-second bucket
+    df['bucket'] = df['timestamp'].dt.floor(f'{secs}s')
+    
+    agg_funcs = {
+        'price': lambda x: (x * df.loc[x.index, 'volume']).sum() / df.loc[x.index, 'volume'].sum(),  # VWAP
+        'volume': 'sum',
+        'side': lambda x: 'buy' if (df.loc[x.index, df.loc[x.index, 'side'] == 'buy', 'volume']).sum() > \
+                                   (df.loc[x.index, df.loc[x.index, 'side'] == 'sell', 'volume']).sum() else 'sell'
+    }
+    
+    # Simpler aggregation: preserve side information
+    grouped = []
+    for bucket, group in df.groupby('bucket'):
+        buy_vol = group[group['side'] == 'buy']['volume'].sum()
+        sell_vol = group[group['side'] == 'sell']['volume'].sum()
+        
+        grouped.append({
+            'timestamp': bucket,
+            'price': (group['price'] * group['volume']).sum() / group['volume'].sum(),  # VWAP
+            'volume': group['volume'].sum(),
+            'side': 'buy' if buy_vol >= sell_vol else 'sell',  # Dominant side
+        })
+    
+    return pd.DataFrame(grouped)
 
 
 def _mark_date_processed(db_manager: ThreadSafeDBManager, date_str: str):
@@ -192,15 +239,18 @@ async def run_historical_backfill(
     tick_size: float = 0.1,
     parallel_downloads: int = 4,
     db_path: str = 'amt_ml_dataset.db',
+    aggregate_secs: int = 1,
 ):
     """
     Streams historical tick data through the AMT engine to populate the ML dataset.
+    
     Features:
       - SAFE MULTITHREADING: Thread-safe DB operations with locks and connection pooling
       - PARALLEL DOWNLOADS: Fetches N days concurrently using ThreadPoolExecutor
       - RESUME SUPPORT: Skips dates already processed (tracked in SQLite)
       - RETRY LOGIC: Automatic retries for transient network failures
       - DATA FROM 2020: Full support from Binance Futures launch
+      - AGGREGATION: Optional time-based aggregation to reduce HFT noise (default: 1 sec)
 
     Args:
         symbol:                  Trading pair, e.g. 'btcusdt'
@@ -210,11 +260,16 @@ async def run_historical_backfill(
         tick_size:               Price bucket granularity for volume profile
         parallel_downloads:      How many days to download concurrently (default 4)
         db_path:                 Path to ML dataset database file
+        aggregate_secs:          Aggregate ticks to N-second candles (default 1)
+                                 - 0: Keep tick-by-tick (more data, slower)
+                                 - 1: Per-second aggregation (recommended)
+                                 - 5+: Coarser aggregation (less noise, but may lose signals)
     """
     from main import AMTSession
 
     logger.info(f"🚀 Starting historical backfill for {symbol.upper()}")
     logger.info(f"   Threads: {parallel_downloads} parallel downloads")
+    logger.info(f"   Aggregation: {aggregate_secs}s bucketing" if aggregate_secs > 0 else "   Aggregation: tick-by-tick (no bucketing)")
     logger.info(f"   Python Version: {__import__('sys').version.split()[0]}")
 
     # ── Thread-Safe Database Setup ──────────────────────────────────────────────
@@ -267,13 +322,15 @@ async def run_historical_backfill(
     futures_to_date = {}
 
     try:
-        # Submit all download tasks concurrently
+        # Submit all download tasks concurrently with aggregation parameter
         for date_str in all_dates:
             future = loop.run_in_executor(
                 executor, 
                 _download_day_sync, 
                 symbol, 
-                date_str
+                date_str,
+                3,  # max_retries
+                aggregate_secs  # PASS AGGREGATION PARAMETER
             )
             futures_to_date[future] = date_str
 
@@ -343,11 +400,11 @@ async def run_historical_backfill(
         total_signals = labeled = 0
 
     logger.info("=" * 70)
-    logger.info(f"🏁 BACKFILL COMPLETE (Multithreaded Safe Mode)")
-    logger.info(f"   Trades processed : {total_trades:,}")
-    logger.info(f"   Total signals    : {total_signals:,}")
-    logger.info(f"   Labeled signals  : {labeled:,}")
-    logger.info(f"   Dataset file     : {db_path}")
+    logger.info(f"🏁 BACKFILL COMPLETE (Multithreaded Safe Mode + {aggregate_secs}s Aggregation)")
+    logger.info(f"   Traded units    : {total_trades:,}")
+    logger.info(f"   Total signals   : {total_signals:,}")
+    logger.info(f"   Labeled signals : {labeled:,}")
+    logger.info(f"   Dataset file    : {db_path}")
     logger.info("=" * 70)
 
 
@@ -371,7 +428,8 @@ if __name__ == "__main__":
             end_date_str="2026-03-17",        # Update to yesterday
             candle_timeframe_seconds=900,     # 15-minute candles
             tick_size=0.1,
-            parallel_downloads=4,             # Download 4 days concurrently (adjust based on bandwidth)
+            aggregate_secs=1,                 # Aggregate to 1-second candles (recommended)
+            parallel_downloads=10,             # Download 10 days concurrently (adjust based on bandwidth)
             db_path='amt_ml_dataset.db',
         )
     )
