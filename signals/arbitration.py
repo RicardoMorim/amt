@@ -18,9 +18,14 @@ class SignalArbitrator:
 
     def _craft_json(self, raw_signal: dict, context: dict) -> dict:
         """ Formats a raw signal dict into the ML-ready dataset structure """
-        signal = dict(context) # Copy base context metrics
-        now_str = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+        signal = dict(context)  # Copy base context metrics
         
+        # Use the candle_time from context as the event timestamp, not the system time!
+        if 'candle_time' in context:
+            now_str = context['candle_time']
+        else:
+            now_str = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+            
         signal['id'] = str(uuid.uuid4())
         signal['timestamp_event'] = now_str
         signal['signal_type'] = raw_signal['signal_type']
@@ -56,7 +61,12 @@ class SignalArbitrator:
         
         composite = dict(context)
         composite['id'] = str(uuid.uuid4())
-        composite['timestamp_event'] = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+        
+        if 'candle_time' in context:
+            composite['timestamp_event'] = context['candle_time']
+        else:
+            composite['timestamp_event'] = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+            
         composite['is_composite'] = True
         composite['component_signals'] = [
             {'signal_type': s['signal_type'], 'direction': s['direction'], 'weight': self.weights.get(s['signal_type'], 1.0)}

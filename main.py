@@ -12,6 +12,7 @@ from signals.balance_breakout import detect_balance_breakout
 from signals.volume_imbalance import detect_aggression_spike, detect_cvd_divergence
 from signals.arbitration import SignalArbitrator
 from alerts.console import ConsoleAlert
+from data.ml_collector import MLDataCollector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -28,6 +29,7 @@ class AMTSession:
         self.profile_mgr = SessionProfileManager(tick_size=tick_size, value_area_pct=0.68)
         self.alert = alert_dispatcher or ConsoleAlert()
         self.arbitrator = SignalArbitrator()
+        self.ml_collector = MLDataCollector(look_forward_minutes=15)
         
         # State
         self.current_candle_start = None
@@ -54,7 +56,8 @@ class AMTSession:
                 for k in res:
                     # [Open time, Open, High, Low, Close, Volume, Close time, Quote asset volume, Number of trades, Taker buy base volume, Taker buy quote volume, Ignore]
                     candle = {
-                        'timestamp': pd.to_datetime(k[0], unit='ms'),
+                        # Force tz-naive UTC so timestamps are consistent throughout the engine
+                        'timestamp': pd.to_datetime(k[0], unit='ms').tz_localize(None),
                         'open': float(k[1]),
                         'high': float(k[2]),
                         'low': float(k[3]),
@@ -216,8 +219,13 @@ class AMTSession:
         cvd_slope_short = working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-5] if len(working_history) >= 5 else 0
         cvd_slope_long = working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-60] if len(working_history) >= 60 else 0
         
+        # Ensure the candle timestamp is always tz-naive before formatting
+        raw_ts = latest_candle['timestamp']
+        if hasattr(raw_ts, 'tzinfo') and raw_ts.tzinfo is not None:
+            raw_ts = raw_ts.replace(tzinfo=None)
+        
         context = {
-            "candle_time": latest_candle['timestamp'].isoformat() + "Z",
+            "candle_time": raw_ts.isoformat() + "Z",
             "timeframe_secs": self.candle_timeframe_seconds,
             "asset": self.symbol,
             "trigger_price": trigger_price,
@@ -259,7 +267,11 @@ class AMTSession:
             try:
                 final_signal, all_jsons = self.arbitrator.arbitrate(raw_signals, context)
                 
-                # Phase 2 ML: Here we have "all_jsons" fully structured. We could save them to .parquet/.csv
+                # Phase 2 ML: Save all signals (both raw and composites)
+                for sj in all_jsons:
+                    self.ml_collector.insert_signal(sj)
+                if final_signal and final_signal.get('is_composite', False):
+                     self.ml_collector.insert_signal(final_signal)
                 
                 if final_signal and is_closed:
                     if final_signal['direction'] != 'CONFLICT':
@@ -273,6 +285,14 @@ class AMTSession:
                         
             except Exception as e:
                 logging.error(f"[{self.symbol}] Falha na Arbitragem de sinais: {e}")
+                
+        # Phase 2 ML: Retroactively label signals if we are closing a candle
+        if is_closed:
+            self.ml_collector.update_labels(
+                current_time_iso=context['candle_time'],
+                current_price=trigger_price,
+                history_df=working_history
+            )
 
 class AMTEngineManager:
     """
