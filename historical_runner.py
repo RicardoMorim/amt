@@ -190,6 +190,15 @@ async def run_historical_backfill(
             session.on_trade(trade)
             total_trades += 1
 
+        # --- End-of-day bulk labeling ---
+        # Build a minute-resolution OHLCV from the day's trades for label lookup
+        if not df.empty:
+            df_indexed = df.set_index('timestamp')
+            ohlcv = df_indexed['price'].resample('1min').ohlc()
+            ohlcv['high'] = df_indexed['price'].resample('1min').max()
+            ohlcv['low']  = df_indexed['price'].resample('1min').min()
+            session.ml_collector.label_all_pending(ohlcv)
+
         _mark_date_processed(conn, date_str)
         logging.info(
             f"[{date_str}] ✅ Done — {len(trades_list):,} trades. "
