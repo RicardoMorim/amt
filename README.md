@@ -17,4 +17,10 @@ Order Flow and Auction Market Theory (AMT) signal engine for detecting volume im
    pip install -r requirements.txt
    ```
    
-2. Implement your data collectors to stream data into the core modules.
+2. add your API keys in a `.env` file:
+   ```
+   ALPACA_API_KEY=KEY
+   ALPACA_SECRET_KEY=KEY
+   ```
+3. Run the real-time signal engine:
+   python main.py
