@@ -5,3 +5,4 @@ python-dotenv
 websockets
 alpaca-trade-api
 pyarrow
+xgboost

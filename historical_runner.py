@@ -553,7 +553,7 @@ if __name__ == "__main__":
         run_historical_backfill(
             symbol="btcusdt",
             start_date_str="2020-01-01",      # From Binance Futures launch
-            end_date_str="2026-03-17",        # Update to yesterday
+            end_date_str="2026-03-19",        # Update to yesterday
             candle_timeframe_seconds=900,     # 15-minute candles
             tick_size=0.1,
             # Aggregate to 1-second candles (recommended)
