@@ -383,8 +383,8 @@ async def run_historical_backfill(
         candle_timeframe_seconds=candle_timeframe_seconds,
         alert_dispatcher=EmptyAlertSender(),
         tick_size=tick_size,
+        preload_history=False,
     )
-
     # ── Date Range Generation ───────────────────────────────────────────────────
     start = datetime.strptime(start_date_str, "%Y-%m-%d")
     end = datetime.strptime(end_date_str, "%Y-%m-%d")
@@ -558,7 +558,7 @@ if __name__ == "__main__":
             tick_size=0.1,
             # Aggregate to 1-second candles (recommended)
             aggregate_secs=1,
-            parallel_downloads=5,
+            parallel_downloads=8,
             db_path='amt_ml_dataset.db',
         )
     )
