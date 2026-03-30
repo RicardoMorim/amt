@@ -17,6 +17,7 @@ Performance fixes (2026-03-30):
   - SQLite WAL mode + NORMAL synchronous pragma for faster concurrent writes
   - SQLite cache_size and mmap_size tuned for large datasets
   - Default parallel_downloads increased to 16
+  - Daily profile reset: SessionProfileManager.reset() called between days
 """
 
 import asyncio
@@ -34,8 +35,7 @@ import pandas as pd
 import requests
 
 import sys
-
-# Logging with forced flush (unbuffered output)
+import config
 
 
 class UnbufferedHandler(logging.StreamHandler):
@@ -50,13 +50,11 @@ logging.basicConfig(
     handlers=[UnbufferedHandler(sys.stdout)]
 )
 
-# Try to import tqdm for a nice progress bar, fall back gracefully
 try:
     from tqdm import tqdm
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
-    # Fallback: create a dummy tqdm class that just returns the iterable
 
     class tqdm:  # type: ignore
         def __init__(self, iterable, **kwargs):
@@ -65,19 +63,10 @@ except ImportError:
         def __iter__(self):
             return iter(self.iterable)
 
-        def update(self, n=1):
-            """No-op: dummy tqdm fallback"""
-            pass
-
-        def set_postfix(self, d):
-            """No-op: dummy tqdm fallback"""
-            pass
-
-        def close(self):
-            """No-op: dummy tqdm fallback"""
-            pass
-    logging.warning(
-        "tqdm not installed. Run 'pip install tqdm' for a progress bar.")
+        def update(self, n=1): pass
+        def set_postfix(self, d): pass
+        def close(self): pass
+    logging.warning("tqdm not installed. Run 'pip install tqdm' for a progress bar.")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -87,16 +76,7 @@ logger.setLevel(logging.INFO)
 # THREAD-SAFE DATABASE MANAGER
 # ───────────────────────────────────────────────────────────────────────────────
 class ThreadSafeDBManager:
-    """Manages thread-safe SQLite operations with connection pooling.
-
-    Performance notes:
-      - WAL journal mode allows concurrent reads while a write is in progress,
-        reducing lock contention across threads.
-      - NORMAL synchronous mode is safe for our use-case (crash mid-write just
-        means we re-process that day on resume) and is significantly faster than
-        the default FULL mode.
-      - cache_size=-131072 allocates 128 MB of page cache per connection.
-    """
+    """Thread-safe SQLite with WAL mode and performance pragmas per connection."""
 
     def __init__(self, db_path: str, pool_size: int = 5):
         self.db_path = db_path
@@ -105,22 +85,18 @@ class ThreadSafeDBManager:
         self._local = threading.local()
 
     def get_connection(self):
-        """Get thread-local database connection with performance pragmas applied."""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(
-                self.db_path, timeout=30, check_same_thread=False)
-            conn.isolation_level = None  # Autocommit mode
-            # ── Performance pragmas ──────────────────────────────────────────
-            conn.execute("PRAGMA journal_mode=WAL")       # concurrent readers
-            conn.execute("PRAGMA synchronous=NORMAL")     # safe + fast writes
-            conn.execute("PRAGMA cache_size=-131072")     # 128 MB page cache
-            conn.execute("PRAGMA mmap_size=268435456")    # 256 MB memory-map
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+            conn.isolation_level = None
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-131072")   # 128 MB
+            conn.execute("PRAGMA mmap_size=268435456")  # 256 MB
             conn.execute("PRAGMA temp_store=MEMORY")
             self._local.conn = conn
         return self._local.conn
 
     def execute(self, query: str, params: tuple = (), fetch: bool = False):
-        """Execute a query safely with automatic retry."""
         with self.lock:
             conn = self.get_connection()
             try:
@@ -136,35 +112,26 @@ class ThreadSafeDBManager:
                 raise
 
     def close_all(self):
-        """Close thread-local connection."""
         if hasattr(self._local, 'conn') and self._local.conn:
             self._local.conn.close()
             self._local.conn = None
 
 
 class EmptyAlertSender:
-    """Dummy alert dispatcher — suppresses console output during backfill."""
-
     def send(self, signal):
-        # No-op: discard all alerts during historical backfill
         pass
 
 
-def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3, aggregate_secs: int = 1, timeout_secs: int = 180) -> pd.DataFrame:
+def _download_day_sync(
+    symbol: str,
+    date_str: str,
+    max_retries: int = 3,
+    aggregate_secs: int = 1,
+    timeout_secs: int = 180,
+) -> pd.DataFrame:
     """
-    Synchronous function that downloads and parses a single day's zip from Binance Vision.
-    Includes retry logic with exponential backoff for transient network failures.
-
-    Args:
-        symbol: Trading pair (e.g., 'btcusdt')
-        date_str: Date string (e.g., '2024-01-15')
-        max_retries: Number of retry attempts for failed downloads
-        aggregate_secs: Aggregate ticks to N-second candles (default 1 = per second)
-                       Set to 0 to keep tick-by-tick (slower, more data)
-        timeout_secs: Request timeout in seconds (Binance Vision can be slow, default 180)
-
-    Returns:
-        DataFrame with columns: timestamp, price, volume, side (aggregated if aggregate_secs > 0)
+    Download and parse a single day's zip from Binance Vision.
+    Includes retry logic with exponential backoff.
     """
     import threading
     url = (
@@ -183,23 +150,19 @@ def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3, aggrega
             start_req = time_module.time()
             response = requests.get(url, timeout=timeout_secs)
             elapsed = time_module.time() - start_req
-            logger.info(
-                f"[{thread_id}] [{date_str}] ✓ HTTP {response.status_code} (took {elapsed:.1f}s)")
+            logger.info(f"[{thread_id}] [{date_str}] ✓ HTTP {response.status_code} (took {elapsed:.1f}s)")
 
             if response.status_code == 404:
-                logger.info(
-                    f"[{thread_id}] [{date_str}] ℹ️ No data (404 - expected for weekends/holidays)")
+                logger.info(f"[{thread_id}] [{date_str}] ℹ️ No data (404)")
                 return pd.DataFrame()
             elif response.status_code != 200:
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                    logger.warning(
-                        f"[{thread_id}] [{date_str}] ⚠️ HTTP {response.status_code} — retry in {wait_time}s...")
+                    wait_time = 2 ** attempt
+                    logger.warning(f"[{thread_id}] [{date_str}] ⚠️ HTTP {response.status_code} — retry in {wait_time}s...")
                     time.sleep(wait_time)
                     continue
                 else:
-                    logger.error(
-                        f"[{thread_id}] [{date_str}] ❌ HTTP {response.status_code} — giving up after {max_retries} attempts")
+                    logger.error(f"[{thread_id}] [{date_str}] ❌ HTTP {response.status_code} — giving up")
                     return pd.DataFrame()
 
             logger.info(f"[{thread_id}] [{date_str}] 📦 Parsing ZIP file...")
@@ -211,15 +174,11 @@ def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3, aggrega
                     df = pd.read_csv(
                         f,
                         header=0,
-                        names=['id', 'price', 'qty', 'quote_qty',
-                               'time', 'is_buyer_maker'],
+                        names=['id', 'price', 'qty', 'quote_qty', 'time', 'is_buyer_maker'],
                     )
 
-            # Drop stray header rows if the CSV had one
-            df = df[pd.to_numeric(
-                df['time'], errors='coerce').notnull()].copy()
-            df['timestamp'] = pd.to_datetime(
-                df['time'].astype(float).astype('int64'), unit='ms')
+            df = df[pd.to_numeric(df['time'], errors='coerce').notnull()].copy()
+            df['timestamp'] = pd.to_datetime(df['time'].astype(float).astype('int64'), unit='ms')
             df['side'] = df['is_buyer_maker'].map(
                 {True: 'sell', False: 'buy', 'True': 'sell', 'False': 'buy'}
             )
@@ -227,11 +186,6 @@ def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3, aggrega
             df['volume'] = pd.to_numeric(df['qty'])
             df = df[['timestamp', 'price', 'volume', 'side']].dropna()
 
-            t_parse_csv = time.time() - t_parse_start
-            logger.debug(
-                f"[{thread_id}] [{date_str}]     CSV parsed in {t_parse_csv:.2f}s ({len(df):,} raw ticks)")
-
-            # ── AGGREGATION: Optional time-based bucketing to reduce noise ──────────
             t_agg_start = time.time()
             if aggregate_secs > 0:
                 df = _aggregate_by_seconds(df, aggregate_secs)
@@ -239,31 +193,28 @@ def _download_day_sync(symbol: str, date_str: str, max_retries: int = 3, aggrega
 
             t_parse_total = time.time() - t_parse_start
             logger.info(
-                f"[{thread_id}] [{date_str}] ✅ SUCCESS: {len(df):,} aggregated units (parsed+agg: {t_parse_total:.2f}s, agg: {t_agg:.2f}s)")
+                f"[{thread_id}] [{date_str}] ✅ SUCCESS: {len(df):,} aggregated units "
+                f"(parsed+agg: {t_parse_total:.2f}s, agg: {t_agg:.2f}s)"
+            )
             return df
 
         except requests.Timeout:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
-                logger.warning(
-                    f"[{thread_id}] [{date_str}] ⏱️ Timeout (>180s) on attempt {attempt + 1}/{max_retries} — waiting {wait_time}s before retry...")
+                logger.warning(f"[{thread_id}] [{date_str}] ⏱️ Timeout — waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             else:
-                logger.error(
-                    f"[{thread_id}] [{date_str}] ❌ Timeout after {max_retries} attempts")
+                logger.error(f"[{thread_id}] [{date_str}] ❌ Timeout after {max_retries} attempts")
                 return pd.DataFrame()
         except (requests.RequestException, zipfile.BadZipFile) as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
-                logger.warning(
-                    f"[{thread_id}] [{date_str}] ⚠️ {type(e).__name__} on attempt {attempt + 1}/{max_retries} — waiting {wait_time}s before retry...")
-                logger.debug(f"   Error details: {str(e)[:150]}")
+                logger.warning(f"[{thread_id}] [{date_str}] ⚠️ {type(e).__name__} — waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             else:
-                logger.error(
-                    f"[{thread_id}] [{date_str}] ❌ Failed after {max_retries} attempts: {type(e).__name__}: {str(e)[:150]}")
+                logger.error(f"[{thread_id}] [{date_str}] ❌ Failed: {type(e).__name__}: {str(e)[:150]}")
                 return pd.DataFrame()
 
     return pd.DataFrame()
@@ -276,25 +227,14 @@ def _download_with_date(
     aggregate_secs: int,
     timeout_secs: int,
 ) -> tuple[str, pd.DataFrame]:
-    """Wrapper that bundles date_str into the return value — fixes Python 3.12+ asyncio.as_completed() incompatibility."""
-    df = _download_day_sync(symbol, date_str, max_retries,
-                            aggregate_secs, timeout_secs)
+    df = _download_day_sync(symbol, date_str, max_retries, aggregate_secs, timeout_secs)
     return date_str, df
 
 
 def _aggregate_by_seconds(df: pd.DataFrame, secs: int) -> pd.DataFrame:
     """
     Aggregate tick-by-tick trades into N-second buckets using VWAP for price.
-
-    Uses fully vectorized pandas resample operations instead of a Python loop —
-    this is 10-50x faster on large tick datasets (millions of rows per day).
-
-    Args:
-        df: DataFrame with columns [timestamp, price, volume, side]
-        secs: Bucket size in seconds
-
-    Returns:
-        DataFrame with aggregated trades (one row per bucket per dominant side)
+    Fully vectorized with pandas resample — 10-50x faster than a Python loop.
     """
     if df.empty:
         return df
@@ -302,30 +242,25 @@ def _aggregate_by_seconds(df: pd.DataFrame, secs: int) -> pd.DataFrame:
     df = df.set_index('timestamp')
     rule = f'{secs}s'
 
-    # VWAP price per bucket — vectorized
     weighted_price = (df['price'] * df['volume']).resample(rule).sum()
-    total_volume = df['volume'].resample(rule).sum()
-    vwap = weighted_price / total_volume
+    total_volume   = df['volume'].resample(rule).sum()
+    vwap           = weighted_price / total_volume
 
-    # Dominant side per bucket — vectorized
-    buy_vol = df[df['side'] == 'buy']['volume'].resample(rule).sum()
+    buy_vol  = df[df['side'] == 'buy']['volume'].resample(rule).sum()
     sell_vol = df[df['side'] == 'sell']['volume'].resample(rule).sum()
     dominant_side = (buy_vol >= sell_vol).map({True: 'buy', False: 'sell'})
 
     result = pd.DataFrame({
-        'price': vwap,
+        'price':  vwap,
         'volume': total_volume,
-        'side': dominant_side,
+        'side':   dominant_side,
     }).dropna(subset=['price', 'volume']).reset_index()
 
-    # Ensure side has no NaN (bucket with only one side will have NaN for the other)
     result['side'] = result['side'].fillna('buy')
-
     return result
 
 
 def _mark_date_processed(db_manager: ThreadSafeDBManager, date_str: str):
-    """Records a date as fully processed so we can resume interrupted runs (thread-safe)."""
     try:
         db_manager.execute(
             "INSERT OR IGNORE INTO processed_dates (date_str) VALUES (?)",
@@ -336,10 +271,8 @@ def _mark_date_processed(db_manager: ThreadSafeDBManager, date_str: str):
 
 
 def _get_processed_dates(db_manager: ThreadSafeDBManager) -> set:
-    """Returns set of already-processed date strings (thread-safe)."""
     try:
-        rows = db_manager.execute(
-            "SELECT date_str FROM processed_dates", fetch=True)
+        rows = db_manager.execute("SELECT date_str FROM processed_dates", fetch=True)
         return {r[0] for r in rows} if rows else set()
     except Exception as e:
         logger.warning(f"Could not retrieve processed dates: {e}")
@@ -347,7 +280,6 @@ def _get_processed_dates(db_manager: ThreadSafeDBManager) -> set:
 
 
 def _ensure_resume_table(db_manager: ThreadSafeDBManager):
-    """Creates the processed_dates tracking table if it doesn't exist (thread-safe)."""
     try:
         db_manager.execute(
             "CREATE TABLE IF NOT EXISTS processed_dates (date_str TEXT PRIMARY KEY)"
@@ -368,42 +300,24 @@ async def run_historical_backfill(
 ):
     """
     Streams historical tick data through the AMT engine to populate the ML dataset.
-
-    Features:
-      - SAFE MULTITHREADING: Thread-safe DB operations with locks and connection pooling
-      - PARALLEL DOWNLOADS: Fetches N days concurrently using ThreadPoolExecutor
-      - RESUME SUPPORT: Skips dates already processed (tracked in SQLite)
-      - RETRY LOGIC: Automatic retries for transient network failures
-      - DATA FROM 2020: Full support from Binance Futures launch
-      - AGGREGATION: Vectorized time-based aggregation (10-50x faster than before)
-
-    Args:
-        symbol:                  Trading pair, e.g. 'btcusdt'
-        start_date_str:          First day to fetch, e.g. '2020-01-01'
-        end_date_str:            Last day to fetch (inclusive), e.g. '2026-03-18'
-        candle_timeframe_seconds: Candle duration in seconds (default 900 = 15m)
-        tick_size:               Price bucket granularity for volume profile
-        parallel_downloads:      How many days to download concurrently (default 16)
-        db_path:                 Path to ML dataset database file
-        aggregate_secs:          Aggregate ticks to N-second candles (default 1)
-                                 - 0: Keep tick-by-tick (more data, slower)
-                                 - 1: Per-second aggregation (recommended)
-                                 - 5+: Coarser aggregation (less noise, but may lose signals)
+    The session's volume profile is reset between days so each day's POC/VAH/VAL
+    reflects only that day's traded volume — matching live-bot behaviour.
     """
     from main import AMTSession
 
     logger.info(f"🚀 Starting historical backfill for {symbol.upper()}")
     logger.info(f"   Threads: {parallel_downloads} parallel downloads")
-    logger.info(f"   Aggregation: {aggregate_secs}s bucketing" if aggregate_secs >
-                0 else "   Aggregation: tick-by-tick (no bucketing)")
+    logger.info(
+        f"   Aggregation: {aggregate_secs}s bucketing"
+        if aggregate_secs > 0
+        else "   Aggregation: tick-by-tick (no bucketing)"
+    )
     logger.info(f"   Python Version: {__import__('sys').version.split()[0]}")
 
-    # ── Thread-Safe Database Setup ──────────────────────────────────────────────
     db_manager = ThreadSafeDBManager(db_path, pool_size=parallel_downloads + 2)
     _ensure_resume_table(db_manager)
     already_done = _get_processed_dates(db_manager)
 
-    # ── Session Setup ───────────────────────────────────────────────────────────
     session = AMTSession(
         symbol=symbol.lower(),
         source='binance',
@@ -412,9 +326,9 @@ async def run_historical_backfill(
         tick_size=tick_size,
         preload_history=False,
     )
-    # ── Date Range Generation ───────────────────────────────────────────────────
+
     start = datetime.strptime(start_date_str, "%Y-%m-%d")
-    end = datetime.strptime(end_date_str, "%Y-%m-%d")
+    end   = datetime.strptime(end_date_str,   "%Y-%m-%d")
     all_dates = []
     current = start
     while current <= end:
@@ -434,7 +348,6 @@ async def run_historical_backfill(
         logger.info("✅ All dates already processed. Nothing to do!")
         return
 
-    # ── Multithreaded Download & Processing ─────────────────────────────────────
     total_trades = 0
     total_trades_lock = Lock()
 
@@ -447,12 +360,9 @@ async def run_historical_backfill(
     elapsed_total = 0
 
     try:
-        logger.info(
-            f"📤 Submitting {total_days} download tasks to {parallel_downloads} threads...")
+        logger.info(f"📤 Submitting {total_days} download tasks to {parallel_downloads} threads...")
         logger.info("=" * 70)
 
-        # ✅ FIX: Collect futures in a plain list — no dict needed
-        #    because date_str comes back inside the tuple from _download_with_date
         all_futures = []
         for date_idx, date_str in enumerate(all_dates, 1):
             future = loop.run_in_executor(
@@ -460,34 +370,29 @@ async def run_historical_backfill(
                 _download_with_date,
                 symbol,
                 date_str,
-                3,             # max_retries
+                3,
                 aggregate_secs,
-                180            # timeout_secs
+                180,
             )
             all_futures.append(future)
             if date_idx % 100 == 0 or date_idx == 1:
                 logger.info(f"   ... submitted {date_idx}/{total_days} tasks")
 
         logger.info("=" * 70)
-        logger.info(
-            f"✅ All {len(all_futures)} tasks submitted. Processing results as they complete...")
-        logger.info(
-            "💡 Threads will log progress. Monitor this output to see activity.")
+        logger.info(f"✅ All {len(all_futures)} tasks submitted. Processing results as they complete...")
         logger.info("=" * 70)
 
         completed_count = 0
         failed_count = 0
         start_time = time.time()
 
-        # ✅ FIX: Python 3.12+ compatible — await each coroutine directly
         for coro in asyncio.as_completed(all_futures):
             try:
-                date_str, df = await coro  # ← await obrigatório no Python 3.12+
+                date_str, df = await coro
                 completed_count += 1
                 elapsed = time.time() - start_time
                 rate = completed_count / elapsed if elapsed > 0 else 0
-                eta_secs = (len(all_futures) - completed_count) / \
-                    rate if rate > 0 else 0
+                eta_secs = (len(all_futures) - completed_count) / rate if rate > 0 else 0
 
                 if df.empty:
                     logger.info(
@@ -502,7 +407,9 @@ async def run_historical_backfill(
                     f"✅ {len(df):>6,} units | Rate: {rate:.2f} d/s | ETA: {int(eta_secs // 60)}m"
                 )
 
-                # Stream trades through the AMT engine
+                # Reset profile at start of each day so POC/VAH/VAL are day-scoped
+                session.profile_mgr.reset()
+
                 t_stream_start = time.time()
                 trades_list = df.to_dict('records')
                 for trade in trades_list:
@@ -512,31 +419,25 @@ async def run_historical_backfill(
                 with total_trades_lock:
                     total_trades += len(trades_list)
 
-                logger.debug(
-                    f"    [{date_str}] ⏳ Streamed {len(trades_list):,} trades in {t_stream:.2f}s")
+                logger.debug(f"    [{date_str}] ⏳ Streamed {len(trades_list):,} trades in {t_stream:.2f}s")
 
-                # End-of-day bulk labeling
                 t_label_start = time.time()
                 df_indexed = df.set_index('timestamp')
                 ohlcv = df_indexed['price'].resample('1min').ohlc()
                 ohlcv['high'] = df_indexed['price'].resample('1min').max()
-                ohlcv['low'] = df_indexed['price'].resample('1min').min()
+                ohlcv['low']  = df_indexed['price'].resample('1min').min()
                 session.ml_collector.label_all_pending(ohlcv)
                 t_label = time.time() - t_label_start
 
-                logger.debug(
-                    f"    [{date_str}] 🏷️ Labeled pending signals in {t_label:.2f}s")
+                logger.debug(f"    [{date_str}] 🏷️ Labeled pending signals in {t_label:.2f}s")
 
                 _mark_date_processed(db_manager, date_str)
-                logger.debug(f"    [{date_str}] 💾 Marked as processed")
 
             except Exception as e:
                 failed_count += 1
                 elapsed = time.time() - start_time
                 rate = completed_count / elapsed if elapsed > 0 else 0
-                eta_secs = (len(all_futures) - completed_count) / \
-                    rate if rate > 0 else 0
-                # date_str may not be bound if await itself failed
+                eta_secs = (len(all_futures) - completed_count) / rate if rate > 0 else 0
                 _date = date_str if 'date_str' in dir() else "unknown"
                 logger.error(
                     f"  [{completed_count + 1:4d}/{len(all_futures)}] [{_date}] "
@@ -550,11 +451,9 @@ async def run_historical_backfill(
         logger.info("📊 BATCH COMPLETE")
         logger.info(f"   ✅ Succeeded   : {completed_count}")
         logger.info(f"   ❌ Failed      : {failed_count}")
-        logger.info(
-            f"   ⏱️  Total time  : {elapsed_total:.0f}s ({elapsed_total // 60:.0f}m {int(elapsed_total % 60)}s)")
+        logger.info(f"   ⏱️  Total time  : {elapsed_total:.0f}s ({elapsed_total // 60:.0f}m {int(elapsed_total % 60)}s)")
         if completed_count > 0:
-            logger.info(
-                f"   📈 Avg speed   : {completed_count / elapsed_total:.2f} days/sec")
+            logger.info(f"   📈 Avg speed   : {completed_count / elapsed_total:.2f} days/sec")
         logger.info("=" * 70)
 
     finally:
@@ -563,29 +462,17 @@ async def run_historical_backfill(
         db_manager.close_all()
         session.ml_collector.close()
 
+
 if __name__ == "__main__":
-    """
-    Configure your date range and parameters here.
-
-    Binance Futures tick data is available from 2020-01-01 onwards.
-    Set end_date to yesterday (Binance data has a ~1 day delay).
-
-    SAFE MULTITHREADING:
-    - Thread-safe database operations with locks
-    - Automatic connection pooling
-    - Retry logic for transient failures
-    - Safe counter updates across threads
-    """
     asyncio.run(
         run_historical_backfill(
-            symbol="btcusdt",
-            start_date_str="2020-01-01",      # From Binance Futures launch
-            end_date_str="2026-03-29",        # Update to yesterday
-            candle_timeframe_seconds=900,     # 15-minute candles
-            tick_size=0.1,
-            # Aggregate to 1-second candles (recommended)
-            aggregate_secs=1,
-            parallel_downloads=16,
-            db_path='amt_ml_dataset.db',
+            symbol=config.SYMBOL,
+            start_date_str=config.BACKFILL_START,
+            end_date_str=config.BACKFILL_END,
+            candle_timeframe_seconds=config.TIMEFRAME_SECS,
+            tick_size=config.TICK_SIZE,
+            aggregate_secs=config.AGGREGATE_SECS,
+            parallel_downloads=config.PARALLEL_DOWNLOADS,
+            db_path=config.DB_PATH,
         )
     )

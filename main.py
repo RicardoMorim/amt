@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import pandas as pd
-import requests
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from data.collector_binance import BinanceDataCollector
@@ -13,13 +13,28 @@ from signals.volume_imbalance import detect_aggression_spike, detect_cvd_diverge
 from signals.arbitration import SignalArbitrator
 from alerts.console import ConsoleAlert
 from data.ml_collector import MLDataCollector
+import config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 class AMTSession:
     """
     Manages the state and heuristics for a SINGLE asset.
+
+    Performance improvements over original:
+      - Rolling accumulators: on_trade() updates _candle_high/low/volume/delta
+        incrementally — _build_candle() is O(1) instead of O(n).
+      - deque for historical_candles: appending is O(1), no DataFrame copy on
+        every candle close.  DataFrame conversion is lazy (only when needed).
+      - Dirty flag cache on SessionProfileManager: get_levels() recomputes only
+        when new ticks have arrived since the last call.
+      - Daily profile reset: volume profile is cleared at UTC midnight so POC/VAH/VAL
+        remain statistically meaningful.
+      - Async preload: _preload_history uses httpx.AsyncClient instead of blocking
+        requests.get(), avoiding event-loop stalls on startup.
     """
+
     def __init__(
         self,
         symbol,
@@ -27,13 +42,12 @@ class AMTSession:
         candle_timeframe_seconds=60,
         alert_dispatcher=None,
         tick_size=0.5,
-        preload_history=True,          # ← NOVO PARÂMETRO
+        preload_history=True,
     ):
         self.symbol = symbol
         self.source = source
         self.candle_timeframe_seconds = candle_timeframe_seconds
 
-        # Tools
         self.profile_mgr = SessionProfileManager(tick_size=tick_size, value_area_pct=0.68)
         self.alert = alert_dispatcher or ConsoleAlert()
         self.arbitrator = SignalArbitrator()
@@ -41,16 +55,32 @@ class AMTSession:
 
         # State
         self.current_candle_start = None
-        self.candle_trades = []
-        self.historical_candles = pd.DataFrame()
-        self.triggered_signals = set()
+        self._candle_trades_count = 0   # lightweight counter (no list)
 
-        # ← SÓ faz preload no modo live
+        # Rolling candle accumulators — updated O(1) per trade
+        self._candle_open:   float | None = None
+        self._candle_high:   float | None = None
+        self._candle_low:    float | None = None
+        self._candle_close:  float | None = None
+        self._candle_volume: float = 0.0
+        self._candle_delta:  float = 0.0
+        self._candle_trades: list = []   # kept only for legacy _build_candle compat
+
+        # Lazy DataFrame: store candles as a deque of dicts, convert to DF on demand
+        self._candle_deque: deque = deque(maxlen=100)
+        self._df_cache: pd.DataFrame = pd.DataFrame()
+        self._df_dirty: bool = False
+
+        # Daily reset tracking (UTC date)
+        self._current_session_date: str | None = None
+
         if preload_history:
-            self._preload_history()
+            asyncio.get_event_loop().run_until_complete(self._preload_history())
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _floor_to_timeframe(self, ts):
-        """Alinha um timestamp ao início do período do timeframe (ex: 14:07:23 → 14:00:00 num TF de 900s)."""
+        """Align a timestamp to the nearest timeframe grid boundary."""
         if isinstance(ts, pd.Timestamp):
             dt = ts.to_pydatetime()
         else:
@@ -61,143 +91,229 @@ class AMTSession:
         floored_seconds = (seconds_since_epoch // tf) * tf
         return epoch + timedelta(seconds=floored_seconds)
 
-    def _preload_history(self):
-        """ Fetch recent candles from REST API so we don't have to wait 10 minutes """
-        if self.source == 'binance':
-            logging.info(f"[{self.symbol}] ⏳ A carregar histórico da Binance para arranque imediato...")
-            interval = f"{int(self.candle_timeframe_seconds/60)}m" if self.candle_timeframe_seconds >= 60 else "1m"
+    def _get_historical_df(self) -> pd.DataFrame:
+        """Return historical candles as a DataFrame, rebuilding only when dirty."""
+        if self._df_dirty or self._df_cache.empty:
+            if not self._candle_deque:
+                return pd.DataFrame()
+            self._df_cache = pd.DataFrame(list(self._candle_deque)).set_index('timestamp')
+            self._df_dirty = False
+        return self._df_cache
 
+    def _reset_candle_accumulators(self):
+        """Zero out rolling candle state."""
+        self._candle_open   = None
+        self._candle_high   = None
+        self._candle_low    = None
+        self._candle_close  = None
+        self._candle_volume = 0.0
+        self._candle_delta  = 0.0
+        self._candle_trades_count = 0
+        self._candle_trades.clear()
+
+    async def _preload_history(self):
+        """Fetch recent candles via async HTTP — no event-loop blocking."""
+        if self.source != 'binance':
+            return
+        logging.info(f"[{self.symbol}] ⏳ A carregar histórico da Binance para arranque imediato...")
+        interval = (
+            f"{int(self.candle_timeframe_seconds / 60)}m"
+            if self.candle_timeframe_seconds >= 60
+            else "1m"
+        )
+        url = (
+            f"https://fapi.binance.com/fapi/v1/klines"
+            f"?symbol={self.symbol.upper()}&interval={interval}&limit=50"
+        )
+        try:
             try:
-                url = f"https://fapi.binance.com/fapi/v1/klines?symbol={self.symbol.upper()}&interval={interval}&limit=50"
-                res = requests.get(url).json()
+                import httpx
+                async with httpx.AsyncClient(timeout=15) as client:
+                    res = (await client.get(url)).json()
+            except ImportError:
+                # Fallback to requests in a thread executor if httpx not installed
+                import requests
+                import asyncio as _asyncio
+                loop = _asyncio.get_event_loop()
+                res = await loop.run_in_executor(
+                    None, lambda: requests.get(url, timeout=15).json()
+                )
 
-                preload = []
-                for k in res:
-                    candle = {
-                        'timestamp': pd.to_datetime(k[0], unit='ms').tz_localize(None),
-                        'open': float(k[1]),
-                        'high': float(k[2]),
-                        'low': float(k[3]),
-                        'close': float(k[4]),
-                        'volume': float(k[5]),
-                        'delta': float(k[9]) - (float(k[5]) - float(k[9]))
-                    }
-                    preload.append(candle)
+            preload = []
+            for k in res:
+                candle = {
+                    'timestamp': pd.to_datetime(k[0], unit='ms').tz_localize(None),
+                    'open':   float(k[1]),
+                    'high':   float(k[2]),
+                    'low':    float(k[3]),
+                    'close':  float(k[4]),
+                    'volume': float(k[5]),
+                    'delta':  float(k[9]) - (float(k[5]) - float(k[9])),
+                }
+                preload.append(candle)
 
-                self.historical_candles = pd.DataFrame(preload).set_index('timestamp')
-                self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
+            for c in preload:
+                self._candle_deque.append(c)
 
-                for _, c in self.historical_candles.iloc[-20:].iterrows():
-                    self.profile_mgr.update(price=c['close'], volume=c['volume'])
+            self._df_dirty = True
+            df = self._get_historical_df()
+            df['cvd'] = df['delta'].cumsum()
+            # Persist cvd back into the deque entries
+            for i, c in enumerate(self._candle_deque):
+                c['cvd'] = float(df['cvd'].iloc[i])
+            self._df_dirty = True
 
-                logging.info(f"[{self.symbol}] ✅ Histórico carregado. Motor pronto a disparar sinais!")
+            for _, c in df.iloc[-20:].iterrows():
+                self.profile_mgr.update(price=c['close'], volume=c['volume'])
 
-            except Exception as e:
-                logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico: {e}")
+            logging.info(f"[{self.symbol}] ✅ Histórico carregado. Motor pronto a disparar sinais!")
 
-    def on_trade(self, trade):
-        """ Callback fired on every single trade coming from WebSockets """
+        except Exception as e:
+            logging.warning(f"[{self.symbol}] Falha ao pré-carregar histórico: {e}")
 
-        # 1. Update Volume Profile
-        self.profile_mgr.update(price=trade['price'], volume=trade['volume'])
+    # ── Core trade pipeline ────────────────────────────────────────────────────
 
-        # 2. Add to current candle builder
+    def on_trade(self, trade: dict):
+        """Callback fired on every single trade (WebSocket or backfill)."""
+
+        price  = float(trade['price'])
+        volume = float(trade['volume'])
+        side   = trade.get('side')
+
+        # 1. Update Volume Profile (dirty flag set inside update())
+        self.profile_mgr.update(price=price, volume=volume)
+
+        # 2. Daily session reset at UTC midnight
         trade_time = trade['timestamp']
+        if isinstance(trade_time, pd.Timestamp):
+            trade_dt = trade_time.to_pydatetime()
+        else:
+            trade_dt = trade_time
 
+        trade_date = trade_dt.strftime('%Y-%m-%d')
+        if self._current_session_date is None:
+            self._current_session_date = trade_date
+        elif trade_date != self._current_session_date:
+            logging.info(
+                f"[{self.symbol}] 🗓️ Nova sessão UTC ({trade_date}). A resetar volume profile..."
+            )
+            self.profile_mgr.reset()
+            self._current_session_date = trade_date
+
+        # 3. Candle timing
         if self.current_candle_start is None:
-            # ← FIX: alinha ao grid do timeframe em vez de só remover microssegundos
             self.current_candle_start = self._floor_to_timeframe(trade_time)
-            logging.info(f"[{self.symbol}] 🟢 A iniciar construção de vela ({self.candle_timeframe_seconds}s) às {self.current_candle_start}...")
+            logging.info(
+                f"[{self.symbol}] 🟢 A iniciar construção de vela "
+                f"({self.candle_timeframe_seconds}s) às {self.current_candle_start}..."
+            )
 
-        time_elapsed = (trade_time - self.current_candle_start).total_seconds()
-
+        time_elapsed = (trade_dt - self.current_candle_start).total_seconds()
         if time_elapsed >= self.candle_timeframe_seconds:
             self._close_candle()
-            # ← FIX: alinha ao grid do timeframe
             self.current_candle_start = self._floor_to_timeframe(trade_time)
 
-        self.candle_trades.append(trade)
+        # 4. Update rolling accumulators — O(1), no list iteration
+        if self._candle_open is None:
+            self._candle_open = price
+        self._candle_high   = price if self._candle_high is None else max(self._candle_high, price)
+        self._candle_low    = price if self._candle_low  is None else min(self._candle_low,  price)
+        self._candle_close  = price
+        self._candle_volume += volume
+        if side == 'buy':
+            self._candle_delta += volume
+        elif side == 'sell':
+            self._candle_delta -= volume
+        self._candle_trades.append(trade)   # kept for intra-candle analysis slice
+        self._candle_trades_count += 1
 
-        # Real-time intra-candle analysis (every 50 trades to save CPU)
-        if len(self.candle_trades) > 0 and len(self.candle_trades) % 50 == 0:
-            live_candle = self._build_candle(self.candle_trades, self.current_candle_start)
-            self._analyze_market(live_candle, is_closed=False)
+        # 5. Intra-candle analysis every 50 trades
+        if self._candle_trades_count % 50 == 0:
+            live_candle = self._build_candle(self.current_candle_start)
+            if live_candle:
+                self._analyze_market(live_candle, is_closed=False)
 
-    def _build_candle(self, trades, start_time):
-        if not trades: return None
+    def _build_candle(self, start_time) -> dict | None:
+        """Build candle dict from rolling accumulators — O(1)."""
+        if self._candle_open is None:
+            return None
 
-        open_price  = trades[0]['price']
-        high_price  = max(t['price'] for t in trades)
-        low_price   = min(t['price'] for t in trades)
-        close_price = trades[-1]['price']
-        volume      = sum(t['volume'] for t in trades)
-
-        if 'side' in trades[0] and trades[0]['side'] is not None:
-            candle_delta = sum(t['volume'] if t['side'] == 'buy' else -t['volume'] for t in trades)
-        else:
-            candle_delta = 0
-            last_price = open_price
-            last_direction = 1
-            for t in trades:
-                if t['price'] > last_price:
-                    last_direction = 1
-                elif t['price'] < last_price:
-                    last_direction = -1
-                candle_delta += t['volume'] * last_direction
-                last_price = t['price']
-
-        last_cvd = self.historical_candles['cvd'].iloc[-1] if not self.historical_candles.empty and 'cvd' in self.historical_candles.columns else 0
-        current_cvd = last_cvd + candle_delta
+        historical_df = self._get_historical_df()
+        last_cvd = (
+            float(historical_df['cvd'].iloc[-1])
+            if not historical_df.empty and 'cvd' in historical_df.columns
+            else 0.0
+        )
+        current_cvd = last_cvd + self._candle_delta
 
         return {
             'timestamp': start_time,
-            'open':   open_price,
-            'high':   high_price,
-            'low':    low_price,
-            'close':  close_price,
-            'volume': volume,
-            'delta':  candle_delta,
-            'cvd':    current_cvd
+            'open':   self._candle_open,
+            'high':   self._candle_high,
+            'low':    self._candle_low,
+            'close':  self._candle_close,
+            'volume': self._candle_volume,
+            'delta':  self._candle_delta,
+            'cvd':    current_cvd,
         }
 
     def _close_candle(self):
-        """ Aggregates trades into a candle and runs AMT Heuristics """
-        if not self.candle_trades:
+        """Aggregate trades into a candle, persist to deque, run analysis."""
+        if self._candle_open is None:
             return
 
-        candle = self._build_candle(self.candle_trades, self.current_candle_start)
+        candle = self._build_candle(self.current_candle_start)
+        if candle is None:
+            return
 
-        new_row = pd.DataFrame([candle]).set_index('timestamp')
-        self.historical_candles = pd.concat([self.historical_candles, new_row])
+        self._candle_deque.append(candle)
+        self._df_dirty = True
 
-        if len(self.historical_candles) > 100:
-            self.historical_candles = self.historical_candles.iloc[-100:]
+        logging.info(
+            f"[{self.symbol}] 🔒 Vela Fechada [{candle['timestamp']}] "
+            f"| Close: {candle['close']} "
+            f"| Vol: {candle['volume']:.2f} "
+            f"| Delta: {candle['delta']:.2f}"
+        )
 
-        logging.info(f"[{self.symbol}] 🔒 Vela Fechada [{candle['timestamp']}] | Close: {candle['close']} | Vol: {candle['volume']:.2f} | Delta: {candle['delta']:.2f}")
+        self._reset_candle_accumulators()
 
-        self.candle_trades.clear()
-        self.historical_candles['cvd'] = self.historical_candles['delta'].cumsum()
+        # Recompute cumulative CVD across deque
+        df = self._get_historical_df()
+        if not df.empty:
+            df['cvd'] = df['delta'].cumsum()
+            for i, c in enumerate(self._candle_deque):
+                c['cvd'] = float(df['cvd'].iloc[i])
+            self._df_dirty = True
 
         self._analyze_market(candle, is_closed=True)
-        self.triggered_signals.clear()
+        self._triggered_signals = set()
 
-    def _analyze_market(self, latest_candle, is_closed=False):
-        """ Evaluates current state against AMT Rules """
-        if len(self.historical_candles) < 10:
+    # ── Analysis ───────────────────────────────────────────────────────────────
+
+    def _analyze_market(self, latest_candle: dict, is_closed: bool = False):
+        """Evaluate current state against AMT rules."""
+        historical_df = self._get_historical_df()
+
+        if len(historical_df) < 10:
             if is_closed:
-                logging.info(f"[{self.symbol}] ⏳ A compilar histórico base... ({len(self.historical_candles)}/10 velas completas)")
+                logging.info(
+                    f"[{self.symbol}] ⏳ A compilar histórico base... "
+                    f"({len(historical_df)}/10 velas completas)"
+                )
             return
 
+        # get_levels() returns cached result if profile unchanged
         profile_data = self.profile_mgr.get_levels()
         if not profile_data:
             return
 
         if not is_closed:
             new_row = pd.DataFrame([latest_candle]).set_index('timestamp')
-            working_history = pd.concat([self.historical_candles, new_row])
+            working_history = pd.concat([historical_df, new_row])
             working_history['cvd'] = working_history['delta'].cumsum()
         else:
-            working_history = self.historical_candles
+            working_history = historical_df
 
         cvd_data = working_history[['cvd', 'delta']]
 
@@ -210,62 +326,70 @@ class AMTSession:
         distance_to_poc     = trigger_price - poc
         distance_to_poc_pct = (distance_to_poc / poc) if poc > 0 else 0
 
-        recent_vol   = self.historical_candles['volume'].iloc[-20:]
-        vol_std      = recent_vol.std()
+        recent_vol    = working_history['volume'].iloc[-20:]
+        vol_std       = recent_vol.std()
         volume_zscore = (latest_candle['volume'] - recent_vol.mean()) / (vol_std if vol_std > 0 else 1)
 
-        recent_delta  = self.historical_candles['delta'].iloc[-20:]
+        recent_delta  = working_history['delta'].iloc[-20:]
         del_std       = recent_delta.std()
         delta_zscore  = (latest_candle['delta'] - recent_delta.mean()) / (del_std if del_std > 0 else 1)
 
-        cvd_slope_short = working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-5]  if len(working_history) >= 5  else 0
-        cvd_slope_long  = working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-60] if len(working_history) >= 60 else 0
+        cvd_slope_short = (
+            working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-5]
+            if len(working_history) >= 5 else 0
+        )
+        cvd_slope_long = (
+            working_history['cvd'].iloc[-1] - working_history['cvd'].iloc[-60]
+            if len(working_history) >= 60 else 0
+        )
 
-        # ── FIX: usa o timestamp DA VELA (histórico correto), não datetime.now() ──
         raw_ts = latest_candle['timestamp']
         if isinstance(raw_ts, pd.Timestamp):
             raw_ts = raw_ts.to_pydatetime()
         if hasattr(raw_ts, 'tzinfo') and raw_ts.tzinfo is not None:
             raw_ts = raw_ts.replace(tzinfo=None)
-        # Formata como ISO 8601 com Z (UTC)
         candle_time_iso = raw_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         context = {
-            "candle_time":          candle_time_iso,   # ← timestamp histórico correto
-            "timeframe_secs":       self.candle_timeframe_seconds,
-            "asset":                self.symbol,
-            "trigger_price":        trigger_price,
-            "close_price":          trigger_price,
-            "session_id":           raw_ts.strftime('%Y-%m-%d'),
-            "session_state":        session_state,
-            "vah":                  vah,
-            "val":                  val,
-            "poc":                  poc,
-            "distance_to_poc":      distance_to_poc,
-            "distance_to_poc_pct":  round(distance_to_poc_pct, 5),
-            "volume":               latest_candle['volume'],
-            "volume_zscore":        round(volume_zscore, 2),
-            "delta":                latest_candle['delta'],
-            "delta_zscore":         round(delta_zscore, 2),
-            "cvd_current":          latest_candle['cvd'],
-            "cvd_slope_short":      cvd_slope_short,
-            "cvd_slope_long":       cvd_slope_long,
+            "candle_time":         candle_time_iso,
+            "timeframe_secs":      self.candle_timeframe_seconds,
+            "asset":               self.symbol,
+            "trigger_price":       trigger_price,
+            "close_price":         trigger_price,
+            "session_id":          raw_ts.strftime('%Y-%m-%d'),
+            "session_state":       session_state,
+            "vah":                 vah,
+            "val":                 val,
+            "poc":                 poc,
+            "distance_to_poc":     distance_to_poc,
+            "distance_to_poc_pct": round(distance_to_poc_pct, 5),
+            "volume":              latest_candle['volume'],
+            "volume_zscore":       round(volume_zscore, 2),
+            "delta":               latest_candle['delta'],
+            "delta_zscore":        round(delta_zscore, 2),
+            "cvd_current":         latest_candle['cvd'],
+            "cvd_slope_short":     cvd_slope_short,
+            "cvd_slope_long":      cvd_slope_long,
         }
 
         raw_signals = []
 
         prices_list    = working_history['close'].tolist()[-4:-1]
         false_breakout = check_false_breakout(trigger_price, prices_list, profile_data)
-        if false_breakout: raw_signals.append(false_breakout)
+        if false_breakout:
+            raw_signals.append(false_breakout)
 
         breakout = detect_balance_breakout(latest_candle, cvd_data, profile_data, working_history.iloc[-20:-1])
-        if breakout: raw_signals.append(breakout)
+        if breakout:
+            raw_signals.append(breakout)
 
         divergence = detect_cvd_divergence(working_history['close'], working_history['cvd'])
-        if divergence: raw_signals.append(divergence)
+        if divergence:
+            raw_signals.append(divergence)
 
         spike = detect_aggression_spike(working_history['delta'])
-        if spike: raw_signals.append(spike)
+        if spike:
+            raw_signals.append(spike)
 
         if raw_signals:
             try:
@@ -279,11 +403,16 @@ class AMTSession:
                 if final_signal and is_closed:
                     if final_signal['direction'] != 'CONFLICT':
                         sig_key = f"{final_signal['signal_type']}_{final_signal['direction']}"
-                        if sig_key not in self.triggered_signals:
-                            self.triggered_signals.add(sig_key)
+                        if sig_key not in getattr(self, '_triggered_signals', set()):
+                            if not hasattr(self, '_triggered_signals'):
+                                self._triggered_signals = set()
+                            self._triggered_signals.add(sig_key)
                             self.alert.send(final_signal)
                     else:
-                        logging.warning(f"[{self.symbol}] ⚠️ Conflito de sinais evitado (Long vs Short) na mesma vela aos {trigger_price}")
+                        logging.warning(
+                            f"[{self.symbol}] ⚠️ Conflito de sinais evitado "
+                            f"(Long vs Short) na mesma vela aos {trigger_price}"
+                        )
 
             except Exception as e:
                 logging.error(f"[{self.symbol}] Falha na Arbitragem de sinais: {e}")
@@ -292,16 +421,17 @@ class AMTSession:
             self.ml_collector.update_labels(
                 current_time_iso=context['candle_time'],
                 current_price=trigger_price,
-                history_df=working_history
+                history_df=working_history,
             )
 
 
 class AMTEngineManager:
     """
-    Orchestrator that spins up multiple WebSockets and Sessions for different assets concurrently.
+    Orchestrator that spins up multiple WebSockets and Sessions for different assets.
     """
+
     def __init__(self):
-        self.alert    = ConsoleAlert()
+        self.alert = ConsoleAlert()
         self.sessions = {}
         self.collectors = []
 
@@ -321,7 +451,11 @@ class AMTEngineManager:
 
 if __name__ == "__main__":
     manager = AMTEngineManager()
-    manager.add_binance_asset(symbol="btcusdt", timeframe_sec=900, tick_size=0.1)
+    manager.add_binance_asset(
+        symbol=config.SYMBOL,
+        timeframe_sec=config.TIMEFRAME_SECS,
+        tick_size=config.TICK_SIZE,
+    )
 
     try:
         loop = asyncio.new_event_loop()
