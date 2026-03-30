@@ -7,87 +7,133 @@ import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Exponential backoff bounds (seconds)
+_BACKOFF_MIN = 1
+_BACKOFF_MAX = 60
+
+
 class BinanceDataCollector:
     """
     Connects to Binance USD-M Futures WebSocket to collect tick-level trade data.
-    This provides the exact data needed for CVD calculation (knowing if trade was buy or sell).
+
+    Robustness improvements (C1):
+      - Exponential backoff reconnect: waits 1s, 2s, 4s … up to 60s between
+        reconnection attempts so we don't hammer Binance on sustained outages.
+      - Heartbeat ping every 20 seconds to detect silent disconnections before
+        Binance closes the connection server-side.
+      - Attempt counter logged so you can see how many times we've reconnected.
+      - Graceful shutdown: calling stop() sets a flag that exits the loop cleanly.
     """
-    
-    # Binance Futures USD-M aggregate trade stream endpoint
+
     WS_URL = "wss://fstream.binance.com/ws/{}@aggTrade"
-    
-    def __init__(self, symbol="BTCUSDT", callback=None):
-        self.symbol = symbol.lower()
-        self.url = self.WS_URL.format(self.symbol)
-        
-        # We can pass a callback function that will be triggered on every incoming trade
-        # e.g., to update the session profile manager live
-        self.callback = callback
-        
-        # Buffer for batch saving to DB/File if needed
-        self.trade_buffer = []
+
+    def __init__(self, symbol: str = "BTCUSDT", callback=None):
+        self.symbol      = symbol.lower()
+        self.url         = self.WS_URL.format(self.symbol)
+        self.callback    = callback
+        self.trade_buffer: list = []
         self.buffer_size = 1000
-        
-    async def _handle_message(self, message):
-        data = json.loads(message)
-        
-        # Aggregated Trade fields:
-        # e: Event type ("aggTrade")
-        # E: Event time
-        # s: Symbol
-        # p: Price (string)
-        # q: Quantity (string)
-        # m: Is the buyer the market maker? (True means the trade was a SELL at the bid, False means BUY at the ask)
-        
+        self._running    = True
+        self._attempt    = 0
+
+    def stop(self):
+        """Signal the collector to stop after the current reconnect cycle."""
+        self._running = False
+
+    async def _handle_message(self, message: str):
+        data  = json.loads(message)
         price = float(data['p'])
-        qty = float(data['q'])
-        is_buyer_maker = data['m']
-        timestamp = pd.to_datetime(data['E'], unit='ms')
-        
-        # Essential for Order Flow (CVD)
-        side = 'sell' if is_buyer_maker else 'buy'
-        
+        qty   = float(data['q'])
+        side  = 'sell' if data['m'] else 'buy'
         trade = {
-            'timestamp': timestamp,
-            'price': float(price),
-            'volume': float(qty),
-            'side': side
+            'timestamp': pd.to_datetime(data['E'], unit='ms'),
+            'price':     price,
+            'volume':    qty,
+            'side':      side,
         }
-        
         if self.callback:
-            # Send directly to the engine
             self.callback(trade)
-            
-        # Example of buffering trades to save to parquet/csv periodically
         self.trade_buffer.append(trade)
         if len(self.trade_buffer) >= self.buffer_size:
             self._flush_buffer()
-            
+
     def _flush_buffer(self):
-        # In a real system, you'd write this pandas dataframe to InfluxDB, Postgres or .parquet
         df = pd.DataFrame(self.trade_buffer)
-        logging.info(f"Buffered {len(df)} trades. Latest price: {df.iloc[-1]['price']}")
+        logging.info(
+            f"[{self.symbol.upper()}] Buffered {len(df)} trades. "
+            f"Latest price: {df.iloc[-1]['price']}"
+        )
         self.trade_buffer.clear()
 
+    async def _ping_loop(self, ws):
+        """Send a ping every 20 s to keep the connection alive."""
+        try:
+            while True:
+                await asyncio.sleep(20)
+                await ws.ping()
+        except (asyncio.CancelledError, websockets.ConnectionClosed):
+            pass
+
     async def start(self):
-        logging.info(f"Connecting to Binance Futures WS for {self.symbol.upper()}...")
-        
-        async for websocket in websockets.connect(self.url):
+        backoff = _BACKOFF_MIN
+
+        while self._running:
+            self._attempt += 1
+            logging.info(
+                f"[{self.symbol.upper()}] WS connect attempt #{self._attempt} "
+                f"(backoff was {backoff}s)"
+            )
             try:
-                logging.info("Connected!")
-                async for message in websocket:
-                    await self._handle_message(message)
-            except websockets.ConnectionClosed:
-                logging.warning("Binance WS Connection lost. Reconnecting...")
-                continue
+                async with websockets.connect(
+                    self.url,
+                    ping_interval=None,   # we handle pings manually
+                    close_timeout=5,
+                ) as ws:
+                    logging.info(f"[{self.symbol.upper()}] ✅ Connected to Binance Futures WS.")
+                    backoff = _BACKOFF_MIN   # reset backoff on successful connect
+
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
+                    try:
+                        async for message in ws:
+                            await self._handle_message(message)
+                    finally:
+                        ping_task.cancel()
+                        await asyncio.gather(ping_task, return_exceptions=True)
+
+            except websockets.ConnectionClosedOK:
+                if not self._running:
+                    logging.info(f"[{self.symbol.upper()}] 🛑 WS closed cleanly. Stopping.")
+                    break
+                logging.warning(
+                    f"[{self.symbol.upper()}] WS closed normally — reconnecting in {backoff}s..."
+                )
+
+            except websockets.ConnectionClosedError as e:
+                logging.warning(
+                    f"[{self.symbol.upper()}] WS connection error ({e}) — reconnecting in {backoff}s..."
+                )
+
+            except OSError as e:
+                logging.error(
+                    f"[{self.symbol.upper()}] Network error ({e}) — reconnecting in {backoff}s..."
+                )
+
             except Exception as e:
-                logging.error(f"Binance WS Error: {e}")
-                await asyncio.sleep(2)
+                logging.error(
+                    f"[{self.symbol.upper()}] Unexpected WS error ({type(e).__name__}: {e}) "
+                    f"— reconnecting in {backoff}s..."
+                )
+
+            if self._running:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _BACKOFF_MAX)
+
+        logging.info(f"[{self.symbol.upper()}] Collector stopped.")
+
 
 if __name__ == "__main__":
-    # Simple test execution
     try:
         collector = BinanceDataCollector(symbol="btcusdt")
         asyncio.run(collector.start())
     except KeyboardInterrupt:
-        print("\\nDisconnected by user.")
+        print("\nDisconnected by user.")

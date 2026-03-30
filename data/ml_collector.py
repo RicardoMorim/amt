@@ -1,58 +1,72 @@
 import sqlite3
-import pandas as pd
 import logging
+import pandas as pd
 from datetime import datetime, timedelta
+
 
 class MLDataCollector:
     """
     Collects signals from the AMT Engine and saves them to SQLite.
-    
-    Performance optimizations:
-      - Signals are buffered in memory and flushed in batches (every `flush_every` signals).
-      - Labeling is done in bulk at the end of a day, not on every candle close.
-        Call `label_all_pending(history_df)` once per day from historical_runner.py.
+
+    Performance:
+      - Signals buffered in memory and flushed in batches.
+      - Bulk end-of-day labeling via label_all_pending().
+
+    Thread-safety (A2 fix):
+      If an external_conn is provided (e.g. from ThreadSafeDBManager in
+      historical_runner), all writes go through that connection instead of
+      opening a second, uncoordinated one.
     """
-    def __init__(self, db_path="amt_ml_dataset.db", look_forward_minutes=15, flush_every=200):
+
+    def __init__(
+        self,
+        db_path: str = "amt_ml_dataset.db",
+        look_forward_minutes: int = 15,
+        flush_every: int = 200,
+        external_conn=None,          # ← A2: shared connection from historical_runner
+    ):
         self.db_path = db_path
         self.look_forward_minutes = look_forward_minutes
         self.flush_every = flush_every
-        
-        self._buffer = []  # In-memory signal buffer
-        
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        # WAL mode = much faster concurrent writes
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self._buffer = []
+        self._owns_connection = external_conn is None
+
+        if external_conn is not None:
+            self.conn = external_conn
+        else:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+
         self._create_tables()
 
     def _create_tables(self):
         self.conn.execute('''
         CREATE TABLE IF NOT EXISTS signals (
-            id TEXT PRIMARY KEY,
-            timestamp_event TEXT,
-            asset TEXT,
-            timeframe_secs INTEGER,
-            signal_type TEXT,
-            direction TEXT,
-            is_composite BOOLEAN,
-            trigger_price REAL,
-            session_state TEXT,
-            distance_to_poc_pct REAL,
-            volume_zscore REAL,
-            delta_zscore REAL,
-            cvd_slope_short REAL,
-            cvd_slope_long REAL,
-            label_max_fwd_price REAL,
-            label_min_fwd_price REAL,
-            label_win_pct REAL,
-            label_loss_pct REAL,
-            is_labeled BOOLEAN DEFAULT 0
+            id                   TEXT PRIMARY KEY,
+            timestamp_event      TEXT,
+            asset                TEXT,
+            timeframe_secs       INTEGER,
+            signal_type          TEXT,
+            direction            TEXT,
+            is_composite         BOOLEAN,
+            trigger_price        REAL,
+            session_state        TEXT,
+            distance_to_poc_pct  REAL,
+            volume_zscore        REAL,
+            delta_zscore         REAL,
+            cvd_slope_short      REAL,
+            cvd_slope_long       REAL,
+            label_max_fwd_price  REAL,
+            label_min_fwd_price  REAL,
+            label_win_pct        REAL,
+            label_loss_pct       REAL,
+            is_labeled           BOOLEAN DEFAULT 0
         )
         ''')
         self.conn.commit()
 
     def insert_signal(self, signal: dict):
-        """Buffers a signal in memory; flushes to SQLite every `flush_every` signals."""
         try:
             self._buffer.append((
                 str(signal.get('id', 'unknown')),
@@ -68,7 +82,7 @@ class MLDataCollector:
                 float(signal.get('volume_zscore', 0.0)),
                 float(signal.get('delta_zscore', 0.0)),
                 float(signal.get('cvd_slope_short', 0.0)),
-                float(signal.get('cvd_slope_long', 0.0))
+                float(signal.get('cvd_slope_long', 0.0)),
             ))
         except Exception as e:
             logging.warning(f"[MLDataCollector] Failed to buffer signal: {e}")
@@ -78,15 +92,14 @@ class MLDataCollector:
             self._flush_buffer()
 
     def _flush_buffer(self):
-        """Batch-inserts all buffered signals into SQLite in a single transaction."""
         if not self._buffer:
             return
         try:
             self.conn.executemany('''
             INSERT OR IGNORE INTO signals (
-                id, timestamp_event, asset, timeframe_secs, signal_type, direction, is_composite,
-                trigger_price, session_state, distance_to_poc_pct, volume_zscore, delta_zscore,
-                cvd_slope_short, cvd_slope_long
+                id, timestamp_event, asset, timeframe_secs, signal_type, direction,
+                is_composite, trigger_price, session_state, distance_to_poc_pct,
+                volume_zscore, delta_zscore, cvd_slope_short, cvd_slope_long
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', self._buffer)
             self.conn.commit()
@@ -95,16 +108,12 @@ class MLDataCollector:
             logging.error(f"[MLDataCollector] Flush error: {e}")
 
     def label_all_pending(self, history_df: pd.DataFrame):
-        """
-        End-of-day bulk labeling.
-        Called once per day by historical_runner.py after all trades are processed.
-        Labels all signals where enough forward data exists in history_df.
-        """
-        # Flush any remaining buffered signals first
         self._flush_buffer()
 
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, timestamp_event, trigger_price, direction FROM signals WHERE is_labeled = 0")
+        cursor.execute(
+            "SELECT id, timestamp_event, trigger_price, direction FROM signals WHERE is_labeled = 0"
+        )
         unlabeled = cursor.fetchall()
 
         if not unlabeled or history_df.empty:
@@ -113,7 +122,7 @@ class MLDataCollector:
         updates = []
         for sig_id, sig_time_str, trigger_price, direction in unlabeled:
             try:
-                clean = sig_time_str.replace('Z', '').replace('+00:00', '')
+                clean  = sig_time_str.replace('Z', '').replace('+00:00', '')
                 sig_dt = datetime.fromisoformat(clean)
             except Exception:
                 continue
@@ -122,10 +131,7 @@ class MLDataCollector:
 
             try:
                 idx = history_df.index
-                if hasattr(idx, 'tz') and idx.tz is not None:
-                    naive_idx = idx.tz_localize(None)
-                else:
-                    naive_idx = idx
+                naive_idx = idx.tz_localize(None) if hasattr(idx, 'tz') and idx.tz else idx
                 mask = (naive_idx > sig_dt) & (naive_idx <= target_end)
                 forward_window = history_df.loc[mask]
             except Exception:
@@ -140,10 +146,10 @@ class MLDataCollector:
 
             tp = float(trigger_price)
             if direction == 'LONG':
-                win_pct = (max_p - tp) / tp
+                win_pct  = (max_p - tp) / tp
                 loss_pct = (min_p - tp) / tp
             elif direction == 'SHORT':
-                win_pct = (tp - min_p) / tp
+                win_pct  = (tp - min_p) / tp
                 loss_pct = (tp - max_p) / tp
             else:
                 win_pct = loss_pct = 0.0
@@ -153,16 +159,18 @@ class MLDataCollector:
         if updates:
             self.conn.executemany('''
             UPDATE signals
-            SET label_max_fwd_price=?, label_min_fwd_price=?, label_win_pct=?, label_loss_pct=?, is_labeled=1
+            SET label_max_fwd_price=?, label_min_fwd_price=?,
+                label_win_pct=?, label_loss_pct=?, is_labeled=1
             WHERE id=?
             ''', updates)
             self.conn.commit()
             logging.info(f"[MLDataCollector] 🏷️ Labeled {len(updates)} signals in bulk.")
 
     def update_labels(self, current_time_iso: str, current_price: float, history_df: pd.DataFrame):
-        """Legacy method kept for live-bot compatibility. No-op during backfill."""
-        pass  # Labeling is now done in bulk via label_all_pending()
+        """Legacy no-op kept for live-bot compatibility."""
+        pass
 
     def close(self):
         self._flush_buffer()
-        self.conn.close()
+        if self._owns_connection:
+            self.conn.close()
