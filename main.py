@@ -101,7 +101,7 @@ class AMTSession:
         self._triggered_signals: set = set()
 
         if preload_history:
-            asyncio.get_event_loop().run_until_complete(self._preload_history())
+            asyncio.run(self._preload_history())
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -193,7 +193,6 @@ class AMTSession:
             df['cvd'] = df['delta'].cumsum()
             for i, c in enumerate(self._candle_deque):
                 c['cvd'] = float(df['cvd'].iloc[i])
-            self._df_dirty = True
 
             for _, c in df.iloc[-20:].iterrows():
                 self.profile_mgr.update(price=c['close'], volume=c['volume'])

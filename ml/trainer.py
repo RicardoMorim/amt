@@ -3,7 +3,10 @@ ml/trainer.py
 =============
 Trains an XGBoost classifier on AMT signals.
 
-B3: Optuna hyperparameter tuning (TimeSeriesSplit, 50 trials by default).
+B3: Optuna hyperparameter tuning (Walk-Forward, 50 trials by default).
+    Expanding-window walk-forward replaces TimeSeriesSplit for realistic
+    temporal splits — training window grows over time while validation
+    is a fixed forward-looking period.
 B4: Temporal + regime features (see dataset_builder.py).
 B1+B2: LabelEncoders serialised with model.
 
@@ -18,7 +21,6 @@ import json
 import joblib
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report, roc_auc_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,12 +30,47 @@ import config
 MODEL_PATH    = config.ML_MODEL_PATH
 META_PATH     = config.ML_META_PATH
 ENCODERS_PATH = config.ML_ENCODERS_PATH
-N_SPLITS      = config.ML_N_CV_SPLITS
 OPTUNA_TRIALS = config.ML_OPTUNA_TRIALS
 
+# ── Walk-Forward Validation Configuration ──────────────────────────────────────
+# Expanding-window walk-forward: training window grows, validation is fixed-size.
+# This mimics real trading where you retrain on all available history and validate
+# on the next N bars before rolling forward.
+WF_TRAIN_FRACTION = 0.70   # first 70% of data for initial training
+WF_VAL_SIZE       = 50000  # fixed validation window size (rows)
+WF_STEP           = 25000  # how many rows to advance the validation window each step
 
-def _objective(trial, X, y, n_splits):
-    """Optuna objective: mean AUC across TimeSeriesSplit folds."""
+
+def _walk_forward_splits(n_samples, train_fraction, val_size, step):
+    """Generate walk-forward split indices.
+
+    Expanding-window approach:
+      - Initial training window = n_samples * train_fraction
+      - Validation window = fixed size (val_size)
+      - Each step advances both windows by `step` rows
+      - Training window grows as we move forward in time
+
+    Yields (train_idx, val_idx) tuples.
+    """
+    train_start = 0
+    train_end = int(n_samples * train_fraction)
+
+    while True:
+        val_start = train_end
+        val_end = min(val_start + val_size, n_samples)
+
+        if val_end - val_start < 1000:  # skip tiny validation windows
+            break
+
+        yield np.arange(train_start, train_end), np.arange(val_start, val_end)
+
+        # Advance — expand training window and move validation forward
+        train_start += step
+        train_end = min(train_start + (val_end - val_start), n_samples)
+
+
+def _objective(trial, X, y):
+    """Optuna objective: mean AUC across walk-forward folds."""
     params = {
         'n_estimators':      trial.suggest_int('n_estimators', 100, 600),
         'max_depth':         trial.suggest_int('max_depth', 3, 8),
@@ -49,9 +86,9 @@ def _objective(trial, X, y, n_splits):
         'random_state':      42,
         'verbosity':         0,
     }
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+
     aucs = []
-    for tr_idx, val_idx in tscv.split(X):
+    for tr_idx, val_idx in _walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP):
         m = xgb.XGBClassifier(**params)
         m.fit(
             X.iloc[tr_idx], y.iloc[tr_idx],
@@ -59,7 +96,8 @@ def _objective(trial, X, y, n_splits):
             verbose=False,
         )
         aucs.append(roc_auc_score(y.iloc[val_idx], m.predict_proba(X.iloc[val_idx])[:, 1]))
-    return float(np.mean(aucs))
+
+    return float(np.mean(aucs)) if aucs else 0.5
 
 
 def train(db_path: str = "amt_ml_dataset.db"):
@@ -72,14 +110,14 @@ def train(db_path: str = "amt_ml_dataset.db"):
     if len(X) < 500:
         print("⚠️  Warning: fewer than 500 samples — model may be unreliable.")
 
-    # ── B3: Optuna tuning ─────────────────────────────────────────────────────
-    print(f"\n🔍 Optuna hyperparameter search ({OPTUNA_TRIALS} trials)...")
+    # ── B3: Optuna tuning with walk-forward validation ────────────────────────
+    print(f"\n🔍 Optuna hyperparameter search ({OPTUNA_TRIALS} trials, walk-forward)...")
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.create_study(direction='maximize')
         study.optimize(
-            lambda trial: _objective(trial, X, y, N_SPLITS),
+            lambda trial: _objective(trial, X, y),
             n_trials=OPTUNA_TRIALS,
             show_progress_bar=True,
         )
@@ -93,11 +131,12 @@ def train(db_path: str = "amt_ml_dataset.db"):
             'subsample': 0.8, 'colsample_bytree': 0.8, 'min_child_weight': 10,
         }
 
-    # ── Cross-validation with best params ─────────────────────────────────────
-    tscv     = TimeSeriesSplit(n_splits=N_SPLITS)
-    cv_aucs  = []
-    print(f"\n📊 Cross-validation ({N_SPLITS}-fold TimeSeriesSplit)...")
-    for fold, (tr_idx, val_idx) in enumerate(tscv.split(X), 1):
+    # ── Walk-Forward Cross-Validation with best params ────────────────────────
+    wf_aucs = []
+    wf_val_sizes = []
+    print(f"\n📊 Walk-forward validation (train={WF_TRAIN_FRACTION}, val_size={WF_VAL_SIZE}, step={WF_STEP})...")
+
+    for fold, (tr_idx, val_idx) in enumerate(_walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP), 1):
         m = xgb.XGBClassifier(
             **best_params,
             scale_pos_weight=(y.iloc[tr_idx] == 0).sum() / max((y.iloc[tr_idx] == 1).sum(), 1),
@@ -111,10 +150,12 @@ def train(db_path: str = "amt_ml_dataset.db"):
             verbose=False,
         )
         auc = roc_auc_score(y.iloc[val_idx], m.predict_proba(X.iloc[val_idx])[:, 1])
-        cv_aucs.append(auc)
-        print(f"   Fold {fold}: AUC = {auc:.4f} | val_size = {len(y.iloc[val_idx]):,}")
+        wf_aucs.append(auc)
+        wf_val_sizes.append(len(val_idx))
+        print(f"   Fold {fold}: AUC = {auc:.4f} | train={len(tr_idx):,} val={len(val_idx):,}")
 
-    print(f"\n   Mean AUC = {np.mean(cv_aucs):.4f} ± {np.std(cv_aucs):.4f}")
+    print(f"\n   Mean AUC = {np.mean(wf_aucs):.4f} ± {np.std(wf_aucs):.4f}")
+    print(f"   Total folds: {len(wf_aucs)}")
 
     # ── Final model on all data ────────────────────────────────────────────────
     print("\n🏋️  Training final model on full dataset...")
@@ -128,10 +169,10 @@ def train(db_path: str = "amt_ml_dataset.db"):
     final_model.fit(X, y)
 
     # ── Last fold report ───────────────────────────────────────────────────────
-    _, val_idx = list(tscv.split(X))[-1]
-    y_pred = final_model.predict(X.iloc[val_idx])
-    print("\n📋 Classification report (last fold):")
-    print(classification_report(y.iloc[val_idx], y_pred, target_names=['SKIP', 'TRADE']))
+    last_tr_idx, last_val_idx = list(_walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP))[-1]
+    y_pred = final_model.predict(X.iloc[last_val_idx])
+    print("\n📋 Classification report (last walk-forward fold):")
+    print(classification_report(y.iloc[last_val_idx], y_pred, target_names=['SKIP', 'TRADE']))
 
     # ── Feature importance ────────────────────────────────────────────────────
     print("🔍 Feature importances:")
@@ -147,11 +188,16 @@ def train(db_path: str = "amt_ml_dataset.db"):
     meta = {
         'features':        FEATURES,
         'best_params':     {k: v for k, v in best_params.items() if k not in ('eval_metric',)},
-        'cv_mean_auc':     float(np.mean(cv_aucs)),
-        'cv_std_auc':      float(np.std(cv_aucs)),
+        'cv_mean_auc':     float(np.mean(wf_aucs)),
+        'cv_std_auc':      float(np.std(wf_aucs)),
         'n_train_samples': int(len(X)),
         'n_positive':      int(y.sum()),
         'n_negative':      int((y == 0).sum()),
+        'validation_method': 'walk_forward_expanding',
+        'wf_train_fraction': WF_TRAIN_FRACTION,
+        'wf_val_size':       WF_VAL_SIZE,
+        'wf_step':           WF_STEP,
+        'wf_n_folds':        len(wf_aucs),
     }
     with open(META_PATH, 'w') as f:
         json.dump(meta, f, indent=2)
