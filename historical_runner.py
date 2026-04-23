@@ -32,6 +32,7 @@ from datetime import datetime, timedelta
 from threading import Lock
 
 import pandas as pd
+import numpy as np
 import requests
 
 import sys
@@ -246,9 +247,20 @@ def _aggregate_by_seconds(df: pd.DataFrame, secs: int) -> pd.DataFrame:
     total_volume   = df['volume'].resample(rule).sum()
     vwap           = weighted_price / total_volume
 
-    buy_vol  = df[df['side'] == 'buy']['volume'].resample(rule).sum()
-    sell_vol = df[df['side'] == 'sell']['volume'].resample(rule).sum()
-    dominant_side = (buy_vol >= sell_vol).map({True: 'buy', False: 'sell'})
+    # Fix: compute buy/sell volume on the full resampled index to avoid
+    # misaligned-Series errors when one side has zero trades in a bucket.
+    buy_vol  = df.loc[df['side'] == 'buy', 'volume'].resample(rule).sum()
+    sell_vol = df.loc[df['side'] == 'sell', 'volume'].resample(rule).sum()
+
+    # Reindex both to the full resampled index so they share identical labels
+    idx = weighted_price.index
+    buy_vol  = buy_vol.reindex(idx, fill_value=0.0)
+    sell_vol = sell_vol.reindex(idx, fill_value=0.0)
+
+    dominant_side = pd.Series(
+        np.where(buy_vol >= sell_vol, 'buy', 'sell'),
+        index=idx, name='side'
+    )
 
     result = pd.DataFrame({
         'price':  vwap,
@@ -423,9 +435,11 @@ async def run_historical_backfill(
 
                 t_label_start = time.time()
                 df_indexed = df.set_index('timestamp')
+                # ohlc() already creates high/low/open/close columns — no need to recalculate
                 ohlcv = df_indexed['price'].resample('1min').ohlc()
-                ohlcv['high'] = df_indexed['price'].resample('1min').max()
-                ohlcv['low']  = df_indexed['price'].resample('1min').min()
+                # Ensure index is timezone-naive for consistent comparison in label_all_pending
+                if hasattr(ohlcv.index, 'tz') and ohlcv.index.tz is not None:
+                    ohlcv.index = ohlcv.index.tz_localize(None)
                 session.ml_collector.label_all_pending(ohlcv)
                 t_label = time.time() - t_label_start
 
@@ -443,8 +457,7 @@ async def run_historical_backfill(
                     f"  [{completed_count + 1:4d}/{len(all_futures)}] [{_date}] "
                     f"❌ {type(e).__name__}: {str(e)[:80]} | Rate: {rate:.2f} d/s | ETA: {int(eta_secs // 60)}m"
                 )
-                if _date != "unknown":
-                    _mark_date_processed(db_manager, _date)
+                # NOTE: Do NOT mark failed dates as processed — they need to be retried
 
         elapsed_total = time.time() - start_time
         logger.info("=" * 70)

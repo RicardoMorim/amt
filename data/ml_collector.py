@@ -119,20 +119,32 @@ class MLDataCollector:
         if not unlabeled or history_df.empty:
             return
 
+        # Ensure history_df index is timezone-naive datetime for consistent comparisons
+        idx = history_df.index
+        if hasattr(idx, 'tz') and idx.tz is not None:
+            idx = idx.tz_localize(None)
+        elif not isinstance(idx, pd.DatetimeIndex):
+            try:
+                idx = pd.to_datetime(idx)
+            except Exception:
+                return
+
         updates = []
         for sig_id, sig_time_str, trigger_price, direction in unlabeled:
             try:
-                clean  = sig_time_str.replace('Z', '').replace('+00:00', '')
-                sig_dt = datetime.fromisoformat(clean)
+                clean  = str(sig_time_str).replace('Z', '').replace('+00:00', '')
+                sig_dt = pd.Timestamp(clean)
+                # Make sure signal datetime is naive to match the index
+                if hasattr(sig_dt, 'tz') and sig_dt.tz is not None:
+                    sig_dt = sig_dt.replace(tzinfo=None)
             except Exception:
                 continue
 
             target_end = sig_dt + timedelta(minutes=self.look_forward_minutes)
 
+            # Use .loc with explicit datetime index for reliable slicing
             try:
-                idx = history_df.index
-                naive_idx = idx.tz_localize(None) if hasattr(idx, 'tz') and idx.tz else idx
-                mask = (naive_idx > sig_dt) & (naive_idx <= target_end)
+                mask = (idx > sig_dt) & (idx <= target_end)
                 forward_window = history_df.loc[mask]
             except Exception:
                 continue
@@ -141,8 +153,12 @@ class MLDataCollector:
                 max_p = float(trigger_price)
                 min_p = float(trigger_price)
             else:
-                max_p = float(forward_window['high'].max())
-                min_p = float(forward_window['low'].min())
+                # Safely get high/low columns, falling back to trigger price
+                high_col = 'high' if 'high' in history_df.columns else None
+                low_col  = 'low'  if 'low'  in history_df.columns else None
+                
+                max_p = float(forward_window['high'].max()) if high_col and not forward_window[high_col].empty else float(trigger_price)
+                min_p = float(forward_window['low'].min()) if low_col and not forward_window[low_col].empty else float(trigger_price)
 
             tp = float(trigger_price)
             if direction == 'LONG':
