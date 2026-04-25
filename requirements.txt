@@ -5,4 +5,7 @@ python-dotenv
 websockets
 alpaca-trade-api
 pyarrow
+joblib
+scikit-learn
 xgboost
+optuna

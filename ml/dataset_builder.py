@@ -22,7 +22,9 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
-DB_PATH      = "amt_ml_dataset.db"
+import config
+
+DB_PATH      = config.DB_PATH
 MIN_RR_RATIO = 1.5
 MIN_WIN_PCT  = 0.003
 
@@ -47,7 +49,7 @@ FEATURES = [
 ]
 
 CAT_COLS = ['signal_type', 'direction', 'session_state']
-ENCODERS_PATH = "ml/amt_encoders.pkl"
+ENCODERS_PATH = config.ML_ENCODERS_PATH
 
 
 def load_dataset(db_path: str = DB_PATH) -> pd.DataFrame:
@@ -94,15 +96,21 @@ def engineer_features(df: pd.DataFrame, encoders: dict | None = None, fit: bool 
         enc_key = f"{col}_enc"
         if fit:
             le = LabelEncoder()
-            df[enc_key] = le.fit_transform(df[col].astype(str))
+            df[enc_key] = pd.Series(
+                le.fit_transform(df[col].astype(str)),
+                index=df.index,
+                name=enc_key,
+            )
             encoders[col] = le
         else:
             le = encoders[col]
             # Handle unseen categories gracefully: map to -1
             known = set(le.classes_)
-            df[enc_key] = df[col].astype(str).apply(
-                lambda x: le.transform([x])[0] if x in known else -1
-            )
+
+            def _encode_value(x: str, _le=le, _known=known) -> int:
+                return int(_le.transform([x])[0]) if x in _known else -1
+
+            df[enc_key] = df[col].astype(str).map(_encode_value)
 
     # ── Target label ───────────────────────────────────────────────────────────
     loss_abs = df['label_loss_pct'].abs().replace(0, 1e-6)
@@ -122,9 +130,13 @@ def engineer_features(df: pd.DataFrame, encoders: dict | None = None, fit: bool 
     return df, encoders
 
 
-def get_X_y(db_path: str = DB_PATH, encoders_path: str = ENCODERS_PATH):
+def get_xy(db_path: str = DB_PATH):
     df = load_dataset(db_path)
     df, encoders = engineer_features(df, fit=True)
     X = df[FEATURES].astype(float)
     y = df['target']
     return X, y, df, encoders
+
+
+# Backward-compatible alias used by trainer.py and older scripts.
+get_X_y = get_xy

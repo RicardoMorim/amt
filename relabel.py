@@ -17,10 +17,13 @@ import sqlite3
 import time
 import requests
 import pandas as pd
+import numpy as np
 from datetime import datetime, timezone
 
+import config
+
 # ── Config ─────────────────────────────────────────────────────────────────────
-DB_PATH        = "amt_ml_dataset.db"
+DB_PATH        = config.DB_PATH
 SYMBOL         = "BTCUSDT"
 INTERVAL       = "15m"          # candle size (match candle_timeframe_seconds=900)
 FORWARD_CANDLES = 8             # look 8×15m = 2 hours forward
@@ -89,15 +92,15 @@ def label_signal(row: dict) -> tuple[float, float]:
 
     # Skip first candle (entry candle), use next FORWARD_CANDLES
     forward = df.iloc[1:FORWARD_CANDLES + 1]
-    highs   = forward["high"].values
-    lows    = forward["low"].values
+    highs   = forward["high"].astype(float).to_numpy()
+    lows    = forward["low"].astype(float).to_numpy()
 
     if direction == "buy":
-        win_pct  = (highs.max() - entry) / entry   # max upside
-        loss_pct = (lows.min()  - entry) / entry   # max downside (negative)
+        win_pct  = (float(np.max(highs)) - entry) / entry   # max upside
+        loss_pct = (float(np.min(lows))  - entry) / entry   # max downside (negative)
     else:  # sell / short
-        win_pct  = (entry - lows.min())  / entry   # max downside profit
-        loss_pct = (entry - highs.max()) / entry   # max adverse (negative)
+        win_pct  = (entry - float(np.min(lows)))  / entry   # max downside profit
+        loss_pct = (entry - float(np.max(highs))) / entry   # max adverse (negative)
 
     return float(win_pct), float(loss_pct)
 
@@ -115,7 +118,6 @@ def relabel_all(db_path: str = DB_PATH, batch_size: int = 50):
 
     total   = len(rows)
     updated = 0
-    errors  = 0
 
     print(f"🏷️  Re-labeling {total:,} signals with {FORWARD_CANDLES}×{INTERVAL} forward window...")
     print(f"   Symbol: {SYMBOL} | Interval: {INTERVAL}")
@@ -142,7 +144,6 @@ def relabel_all(db_path: str = DB_PATH, batch_size: int = 50):
         # Progress + commit every batch
         if i % batch_size == 0:
             conn.commit()
-            non_zero = sum(1 for _, _, _, _ in rows[:i] if True)
             print(f"  [{i:>5}/{total}] committed batch | last win={win_pct:.4f} loss={loss_pct:.4f}")
 
     conn.commit()
@@ -150,7 +151,7 @@ def relabel_all(db_path: str = DB_PATH, batch_size: int = 50):
 
     print("=" * 60)
     print(f"✅ Done. {updated:,} signals re-labeled.")
-    print(f"   Run `python ml/trainer.py` next.")
+    print("   Run `python ml/trainer.py` next.")
 
 
 if __name__ == "__main__":

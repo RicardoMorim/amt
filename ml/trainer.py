@@ -24,7 +24,7 @@ import xgboost as xgb
 from sklearn.metrics import classification_report, roc_auc_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ml.dataset_builder import get_X_y, FEATURES
+from ml.dataset_builder import get_xy, FEATURES
 import config
 
 MODEL_PATH    = config.ML_MODEL_PATH
@@ -100,12 +100,12 @@ def _objective(trial, X, y):
     return float(np.mean(aucs)) if aucs else 0.5
 
 
-def train(db_path: str = "amt_ml_dataset.db"):
+def train(db_path: str = config.DB_PATH):
     print("=" * 60)
     print("🤖 AMT ML Trainer")
     print("=" * 60)
 
-    X, y, df, encoders = get_X_y(db_path, ENCODERS_PATH)
+    X, y, _, encoders = get_xy(db_path)
 
     if len(X) < 500:
         print("⚠️  Warning: fewer than 500 samples — model may be unreliable.")
@@ -169,7 +169,7 @@ def train(db_path: str = "amt_ml_dataset.db"):
     final_model.fit(X, y)
 
     # ── Last fold report ───────────────────────────────────────────────────────
-    last_tr_idx, last_val_idx = list(_walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP))[-1]
+    _, last_val_idx = list(_walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP))[-1]
     y_pred = final_model.predict(X.iloc[last_val_idx])
     print("\n📋 Classification report (last walk-forward fold):")
     print(classification_report(y.iloc[last_val_idx], y_pred, target_names=['SKIP', 'TRADE']))
@@ -210,5 +210,5 @@ def train(db_path: str = "amt_ml_dataset.db"):
 
 
 if __name__ == '__main__':
-    db = sys.argv[1] if len(sys.argv) > 1 else "amt_ml_dataset.db"
+    db = sys.argv[1] if len(sys.argv) > 1 else config.DB_PATH
     train(db)

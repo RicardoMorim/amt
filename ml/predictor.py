@@ -20,13 +20,15 @@ import os
 import joblib
 import numpy as np
 
+import config
+
 
 class AMTPredictor:
 
     def __init__(
         self,
-        model_path:    str   = "ml/amt_model.pkl",
-        encoders_path: str   = "ml/amt_encoders.pkl",
+        model_path:    str   = config.ML_MODEL_PATH,
+        encoders_path: str   = config.ML_ENCODERS_PATH,
         confidence_threshold: float = 0.60,
     ):
         self.model     = joblib.load(model_path)
@@ -38,7 +40,7 @@ class AMTPredictor:
         else:
             self.encoders = {}
 
-        meta_path = model_path.replace('.pkl', '_meta.json').replace('amt_model', 'amt_model_meta')
+        meta_path = config.ML_META_PATH
         try:
             with open(meta_path) as f:
                 self.meta = json.load(f)

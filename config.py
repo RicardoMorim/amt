@@ -3,6 +3,12 @@ config.py — Central configuration for the AMT engine.
 Edit here; all modules import from this file.
 """
 
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+ML_DIR = PROJECT_ROOT / "ml"
+
 # ── Asset ──────────────────────────────────────────────────────────────────────
 SYMBOL          = "btcusdt"
 TICK_SIZE       = 0.1
@@ -16,7 +22,7 @@ BREAKOUT_VOL_MULTIPLIER  = 1.5    # candle volume must be >= avg * this
 BREAKOUT_MIN_BODY_RATIO  = 0.6    # body/range must be >= this
 
 # ── ML / Backfill ─────────────────────────────────────────────────────────────
-DB_PATH                 = "amt_ml_dataset.db"
+DB_PATH                 = str(PROJECT_ROOT / "amt_ml_dataset.db")
 LOOK_FORWARD_MINUTES    = 15
 FLUSH_EVERY             = 200
 
@@ -28,9 +34,9 @@ AGGREGATE_SECS      = 1
 
 # ── ML predictor ──────────────────────────────────────────────────────────────
 ML_CONFIDENCE_THRESHOLD = 0.60     # minimum model confidence to fire an alert
-ML_MODEL_PATH           = "ml/amt_model.pkl"
-ML_ENCODERS_PATH        = "ml/amt_encoders.pkl"
-ML_META_PATH            = "ml/amt_model_meta.json"
+ML_MODEL_PATH           = str(ML_DIR / "amt_model.pkl")
+ML_ENCODERS_PATH        = str(ML_DIR / "amt_encoders.pkl")
+ML_META_PATH            = str(ML_DIR / "amt_model_meta.json")
 ML_OPTUNA_TRIALS        = 50
 ML_N_CV_SPLITS          = 5
 
