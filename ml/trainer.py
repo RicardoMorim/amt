@@ -13,11 +13,13 @@ B1+B2: LabelEncoders serialised with model.
 Usage:
     python ml/trainer.py
     python ml/trainer.py path/to/amt_ml_dataset.db
+    python ml/trainer.py path/to/amt_ml_dataset.db --drop-hour-utc
 """
 
 import os
 import sys
 import json
+import argparse
 import joblib
 import numpy as np
 import xgboost as xgb
@@ -89,23 +91,34 @@ def _objective(trial, X, y):
 
     aucs = []
     for tr_idx, val_idx in _walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP):
+        y_val = y.iloc[val_idx]
+        if len(np.unique(y_val)) < 2:
+            # AUC undefined when validation has a single class.
+            continue
+
         m = xgb.XGBClassifier(**params)
         m.fit(
             X.iloc[tr_idx], y.iloc[tr_idx],
-            eval_set=[(X.iloc[val_idx], y.iloc[val_idx])],
+            eval_set=[(X.iloc[val_idx], y_val)],
             verbose=False,
         )
-        aucs.append(roc_auc_score(y.iloc[val_idx], m.predict_proba(X.iloc[val_idx])[:, 1]))
+        aucs.append(roc_auc_score(y_val, m.predict_proba(X.iloc[val_idx])[:, 1]))
 
     return float(np.mean(aucs)) if aucs else 0.5
 
 
-def train(db_path: str = config.DB_PATH):
+def train(db_path: str = config.DB_PATH, drop_hour_utc: bool = False):
     print("=" * 60)
     print("🤖 AMT ML Trainer")
     print("=" * 60)
 
     X, y, _, encoders = get_xy(db_path)
+    feature_cols = list(X.columns)
+
+    if drop_hour_utc and 'hour_utc' in feature_cols:
+        X = X.drop(columns=['hour_utc'])
+        feature_cols = list(X.columns)
+        print("🧪 Ablation active: removed feature 'hour_utc'.")
 
     if len(X) < 500:
         print("⚠️  Warning: fewer than 500 samples — model may be unreliable.")
@@ -136,7 +149,14 @@ def train(db_path: str = config.DB_PATH):
     wf_val_sizes = []
     print(f"\n📊 Walk-forward validation (train={WF_TRAIN_FRACTION}, val_size={WF_VAL_SIZE}, step={WF_STEP})...")
 
-    for fold, (tr_idx, val_idx) in enumerate(_walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP), 1):
+    skipped_single_class = 0
+    for fold_idx, (tr_idx, val_idx) in enumerate(_walk_forward_splits(len(X), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP), 1):
+        y_val = y.iloc[val_idx]
+        if len(np.unique(y_val)) < 2:
+            print(f"   Fold {fold_idx}: SKIP (só 1 classe na val)")
+            skipped_single_class += 1
+            continue
+
         m = xgb.XGBClassifier(
             **best_params,
             scale_pos_weight=(y.iloc[tr_idx] == 0).sum() / max((y.iloc[tr_idx] == 1).sum(), 1),
@@ -146,16 +166,21 @@ def train(db_path: str = config.DB_PATH):
         )
         m.fit(
             X.iloc[tr_idx], y.iloc[tr_idx],
-            eval_set=[(X.iloc[val_idx], y.iloc[val_idx])],
+            eval_set=[(X.iloc[val_idx], y_val)],
             verbose=False,
         )
-        auc = roc_auc_score(y.iloc[val_idx], m.predict_proba(X.iloc[val_idx])[:, 1])
+        auc = roc_auc_score(y_val, m.predict_proba(X.iloc[val_idx])[:, 1])
         wf_aucs.append(auc)
         wf_val_sizes.append(len(val_idx))
-        print(f"   Fold {fold}: AUC = {auc:.4f} | train={len(tr_idx):,} val={len(val_idx):,}")
+        print(f"   Fold {fold_idx}: AUC = {auc:.4f} | train={len(tr_idx):,} val={len(val_idx):,}")
 
-    print(f"\n   Mean AUC = {np.mean(wf_aucs):.4f} ± {np.std(wf_aucs):.4f}")
-    print(f"   Total folds: {len(wf_aucs)}")
+    if wf_aucs:
+        print(f"\n   Mean AUC = {np.mean(wf_aucs):.4f} ± {np.std(wf_aucs):.4f}")
+    else:
+        print("\n   Mean AUC = N/A (nenhum fold válido)")
+    print(f"   Total folds válidos: {len(wf_aucs)}")
+    if skipped_single_class:
+        print(f"   Folds SKIP (1 classe): {skipped_single_class}")
 
     # ── Final model on all data ────────────────────────────────────────────────
     print("\n🏋️  Training final model on full dataset...")
@@ -176,7 +201,7 @@ def train(db_path: str = config.DB_PATH):
 
     # ── Feature importance ────────────────────────────────────────────────────
     print("🔍 Feature importances:")
-    importances = dict(zip(FEATURES, final_model.feature_importances_))
+    importances = dict(zip(feature_cols, final_model.feature_importances_))
     for feat, imp in sorted(importances.items(), key=lambda x: -x[1]):
         print(f"   {feat:<30} {'█' * int(imp * 40)} {imp:.4f}")
 
@@ -186,10 +211,10 @@ def train(db_path: str = config.DB_PATH):
     joblib.dump(encoders,    ENCODERS_PATH)
 
     meta = {
-        'features':        FEATURES,
+        'features':        feature_cols,
         'best_params':     {k: v for k, v in best_params.items() if k not in ('eval_metric',)},
-        'cv_mean_auc':     float(np.mean(wf_aucs)),
-        'cv_std_auc':      float(np.std(wf_aucs)),
+        'cv_mean_auc':     float(np.mean(wf_aucs)) if wf_aucs else None,
+        'cv_std_auc':      float(np.std(wf_aucs)) if wf_aucs else None,
         'n_train_samples': int(len(X)),
         'n_positive':      int(y.sum()),
         'n_negative':      int((y == 0).sum()),
@@ -198,6 +223,8 @@ def train(db_path: str = config.DB_PATH):
         'wf_val_size':       WF_VAL_SIZE,
         'wf_step':           WF_STEP,
         'wf_n_folds':        len(wf_aucs),
+        'wf_skipped_single_class': skipped_single_class,
+        'ablation_drop_hour_utc': bool(drop_hour_utc),
     }
     with open(META_PATH, 'w') as f:
         json.dump(meta, f, indent=2)
@@ -210,5 +237,8 @@ def train(db_path: str = config.DB_PATH):
 
 
 if __name__ == '__main__':
-    db = sys.argv[1] if len(sys.argv) > 1 else config.DB_PATH
-    train(db)
+    parser = argparse.ArgumentParser(description='Train AMT XGBoost baseline')
+    parser.add_argument('db_path', nargs='?', default=config.DB_PATH)
+    parser.add_argument('--drop-hour-utc', action='store_true', help='Ablation: remove hour_utc feature')
+    args = parser.parse_args()
+    train(db_path=args.db_path, drop_hour_utc=args.drop_hour_utc)
