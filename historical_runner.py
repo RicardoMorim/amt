@@ -300,6 +300,74 @@ def _ensure_resume_table(db_manager: ThreadSafeDBManager):
         logger.error(f"Failed to create resume table: {e}")
 
 
+def _ensure_candles_table(db_manager: ThreadSafeDBManager):
+    """Create local candles table used by robust historical labeler."""
+    try:
+        db_manager.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candles (
+                symbol TEXT NOT NULL,
+                timeframe_secs INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                PRIMARY KEY (symbol, timeframe_secs, timestamp)
+            )
+            """
+        )
+    except Exception as e:
+        logger.error(f"Failed to create candles table: {e}")
+
+
+def _upsert_candles(
+    db_manager: ThreadSafeDBManager,
+    symbol: str,
+    timeframe_secs: int,
+    ohlcv_df: pd.DataFrame,
+):
+    """Insert/ignore candles into SQLite for offline deterministic relabeling."""
+    if ohlcv_df.empty:
+        return
+
+    rows = []
+    for ts, row in ohlcv_df.iterrows():
+        if pd.isna(row.get('open')) or pd.isna(row.get('high')) or pd.isna(row.get('low')) or pd.isna(row.get('close')):
+            continue
+        ts_dt = pd.Timestamp(ts)
+        if ts_dt.tzinfo is None:
+            ts_iso = ts_dt.tz_localize('UTC').isoformat()
+        else:
+            ts_iso = ts_dt.tz_convert('UTC').isoformat()
+        rows.append((
+            str(symbol).lower(),
+            int(timeframe_secs),
+            ts_iso,
+            float(row['open']),
+            float(row['high']),
+            float(row['low']),
+            float(row['close']),
+            float(row.get('volume', 0.0) or 0.0),
+        ))
+
+    if not rows:
+        return
+
+    with db_manager.lock:
+        conn = db_manager.get_connection()
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO candles
+            (symbol, timeframe_secs, timestamp, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+
+
 async def run_historical_backfill(
     symbol: str,
     start_date_str: str,
@@ -328,6 +396,7 @@ async def run_historical_backfill(
 
     db_manager = ThreadSafeDBManager(db_path, pool_size=parallel_downloads + 2)
     _ensure_resume_table(db_manager)
+    _ensure_candles_table(db_manager)
     already_done = _get_processed_dates(db_manager)
 
     session = AMTSession(
@@ -437,6 +506,11 @@ async def run_historical_backfill(
                 df_indexed = df.set_index('timestamp')
                 # ohlc() already creates high/low/open/close columns — no need to recalculate
                 ohlcv = df_indexed['price'].resample('1min').ohlc()
+                # persist session-timeframe candles for deterministic offline relabeling
+                tf_rule = f"{int(candle_timeframe_seconds)}s"
+                ohlcv_tf = df_indexed['price'].resample(tf_rule).ohlc()
+                ohlcv_tf['volume'] = df_indexed['volume'].resample(tf_rule).sum()
+                _upsert_candles(db_manager, symbol=symbol, timeframe_secs=candle_timeframe_seconds, ohlcv_df=ohlcv_tf)
                 # Ensure index is timezone-naive for consistent comparison in label_all_pending
                 if hasattr(ohlcv.index, 'tz') and ohlcv.index.tz is not None:
                     ohlcv.index = ohlcv.index.tz_localize(None)

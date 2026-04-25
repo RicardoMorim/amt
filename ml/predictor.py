@@ -104,17 +104,55 @@ class AMTPredictor:
         except Exception:
             pass
 
+        market_state = s.get('market_state', s.get('session_state', 'unknown'))
+        signal_type = str(s.get('signal_type', 'unknown')).upper()
+
+        # FASE 1 structural features (safe defaults for live mode)
+        false_breakout_flag = 1 if signal_type == 'FALSE_BREAKOUT' else 0
+        price_vs_poc_norm = float(s.get('price_vs_poc_norm', s.get('distance_to_poc_pct', 0.0)) or 0.0)
+        price_vs_value_area = float(s.get('price_vs_value_area', 0.0) or 0.0)
+        atr_20_norm = float(s.get('atr_20_norm', 0.0) or 0.0)
+        dist_to_swing_high_20 = float(s.get('dist_to_swing_high_20', 0.0) or 0.0)
+        dist_to_swing_low_20 = float(s.get('dist_to_swing_low_20', 0.0) or 0.0)
+
+        base = {
+            'distance_to_poc_pct': float(s.get('distance_to_poc_pct', 0.0) or 0.0),
+            'volume_zscore': float(s.get('volume_zscore', 0.0) or 0.0),
+            'delta_zscore': float(s.get('delta_zscore', 0.0) or 0.0),
+            'cvd_slope_short': float(s.get('cvd_slope_short', 0.0) or 0.0),
+            'cvd_slope_long': float(s.get('cvd_slope_long', 0.0) or 0.0),
+            'signal_type_enc': self._encode_cat('signal_type', s.get('signal_type', 'unknown')),
+            'direction_enc': direction_enc,
+            'session_state_enc': self._encode_cat('session_state', s.get('session_state', 'unknown')),
+            'market_state_enc': self._encode_cat('market_state', market_state),
+            'is_composite': int(bool(s.get('is_composite', False))),
+            'timeframe_secs': int(s.get('timeframe_secs', 900)),
+            'hour_utc': hour_utc,
+            'day_of_week': day_of_week,
+            'false_breakout_flag': false_breakout_flag,
+            'price_vs_poc_norm': price_vs_poc_norm,
+            'price_vs_value_area': price_vs_value_area,
+            'atr_20_norm': atr_20_norm,
+            'dist_to_swing_high_20': dist_to_swing_high_20,
+            'dist_to_swing_low_20': dist_to_swing_low_20,
+        }
+
+        # If metadata has explicit feature order, follow it for compatibility.
+        if self.features:
+            return [float(base.get(feat, 0.0)) for feat in self.features]
+
+        # Fallback to legacy order when metadata is missing.
         return [
-            float(s.get('distance_to_poc_pct',  0.0) or 0.0),
-            float(s.get('volume_zscore',         0.0) or 0.0),
-            float(s.get('delta_zscore',          0.0) or 0.0),
-            float(s.get('cvd_slope_short',       0.0) or 0.0),
-            float(s.get('cvd_slope_long',        0.0) or 0.0),
-            self._encode_cat('signal_type',   s.get('signal_type',   'unknown')),
-            direction_enc,
-            self._encode_cat('session_state', s.get('session_state', 'unknown')),
-            int(bool(s.get('is_composite', False))),
-            int(s.get('timeframe_secs', 900)),
-            hour_utc,
-            day_of_week,
+            base['distance_to_poc_pct'],
+            base['volume_zscore'],
+            base['delta_zscore'],
+            base['cvd_slope_short'],
+            base['cvd_slope_long'],
+            base['signal_type_enc'],
+            base['direction_enc'],
+            base['session_state_enc'],
+            base['is_composite'],
+            base['timeframe_secs'],
+            base['hour_utc'],
+            base['day_of_week'],
         ]
