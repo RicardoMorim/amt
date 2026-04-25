@@ -1,0 +1,41 @@
+{
+  "features": [
+    "distance_to_poc_pct",
+    "volume_zscore",
+    "delta_zscore",
+    "cvd_slope_short",
+    "cvd_slope_long",
+    "signal_type_enc",
+    "direction_enc",
+    "session_state_enc",
+    "market_state_enc",
+    "is_composite",
+    "timeframe_secs",
+    "hour_utc",
+    "day_of_week",
+    "false_breakout_flag",
+    "price_vs_poc_norm",
+    "price_vs_value_area",
+    "atr_20_norm",
+    "dist_to_swing_high_20",
+    "dist_to_swing_low_20"
+  ],
+  "best_params": {
+    "n_estimators": 400,
+    "max_depth": 5,
+    "learning_rate": 0.04,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 10
+  },
+  "cv_mean_auc": NaN,
+  "cv_std_auc": NaN,
+  "n_train_samples": 5075037,
+  "n_positive": 45803,
+  "n_negative": 5029234,
+  "validation_method": "walk_forward_expanding",
+  "wf_train_fraction": 0.7,
+  "wf_val_size": 50000,
+  "wf_step": 25000,
+  "wf_n_folds": 202
+}

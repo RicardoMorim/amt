@@ -150,12 +150,21 @@ def _compute_regime_performance(df_hold: pd.DataFrame, split_idx: int, y_hold: n
     return regime_perf
 
 
-def _compute_fold_stability(x: np.ndarray, y: np.ndarray, threshold: float, xgb_model, device: torch.device):
+def _compute_fold_stability(
+    x: np.ndarray,
+    y: np.ndarray,
+    threshold: float,
+    xgb_model,
+    device: torch.device,
+    max_folds: int,
+):
     fold_rows = []
     _set_seed(42)
     mlp_cfg = NNTrainConfig()
 
     for fold, (tr_idx, val_idx) in enumerate(walk_forward_splits(len(x), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP), 1):
+        if fold > max_folds:
+            break
         y_val = y[val_idx]
 
         xgb_p = _predict_xgb(xgb_model, x[val_idx])
@@ -199,7 +208,11 @@ def _compute_fold_stability(x: np.ndarray, y: np.ndarray, threshold: float, xgb_
     return pd.DataFrame(fold_rows)
 
 
-def compare_models(db_path: str = config.DB_PATH, threshold: float = config.ML_CONFIDENCE_THRESHOLD) -> dict:
+def compare_models(
+    db_path: str = config.DB_PATH,
+    threshold: float = config.ML_CONFIDENCE_THRESHOLD,
+    max_folds: int = 20,
+) -> dict:
     print("=" * 70)
     print("📊 AMT Comparative Evaluator (XGB vs MLP)")
     print("=" * 70)
@@ -243,6 +256,7 @@ def compare_models(db_path: str = config.DB_PATH, threshold: float = config.ML_C
         threshold=threshold,
         xgb_model=xgb_model,
         device=device,
+        max_folds=max_folds,
     )
 
     summary = {
@@ -303,9 +317,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Compare AMT models: XGB vs MLP")
     p.add_argument('--db-path', default=config.DB_PATH)
     p.add_argument('--threshold', type=float, default=config.ML_CONFIDENCE_THRESHOLD)
+    p.add_argument('--max-folds', type=int, default=20)
     return p
 
 
 if __name__ == '__main__':
     args = _build_parser().parse_args()
-    compare_models(db_path=args.db_path, threshold=args.threshold)
+    compare_models(db_path=args.db_path, threshold=args.threshold, max_folds=args.max_folds)

@@ -90,6 +90,7 @@ class NNTrainConfig:
     patience: int = 10
     batch_size: int = 256
     seed: int = 42
+    max_folds: int = 20
 
 
 def _set_seed(seed: int) -> None:
@@ -197,6 +198,8 @@ def train(db_path: str = config.DB_PATH, cfg: NNTrainConfig | None = None):
     print(f"\n📊 Walk-forward validation (train={WF_TRAIN_FRACTION}, val_size={WF_VAL_SIZE}, step={WF_STEP})...")
 
     for fold, (tr_idx, val_idx) in enumerate(walk_forward_splits(len(x_np), WF_TRAIN_FRACTION, WF_VAL_SIZE, WF_STEP), 1):
+        if fold > cfg.max_folds:
+            break
         # last 10% of train window used for early stopping validation; fold val kept untouched for metric
         tr_cut = max(100, int(len(tr_idx) * 0.90))
         tr_main = tr_idx[:tr_cut]
@@ -318,6 +321,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--h1', type=int, default=64)
     p.add_argument('--h2', type=int, default=32)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--max-folds', type=int, default=20)
     return p
 
 
@@ -332,5 +336,6 @@ if __name__ == '__main__':
         patience=args.patience,
         batch_size=args.batch_size,
         seed=args.seed,
+        max_folds=args.max_folds,
     )
     train(db_path=args.db_path, cfg=cfg)
