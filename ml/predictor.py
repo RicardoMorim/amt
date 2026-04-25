@@ -15,32 +15,89 @@ Usage:
     # → {'action': 'BUY', 'confidence': 0.73, 'skip_reason': None}
 """
 
+from __future__ import annotations
+
 import json
 import os
 import joblib
 import numpy as np
+import torch
+import torch.nn as nn
 
 import config
 
 
+class _TabularMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: tuple[int, int] = (64, 32), dropout: float = 0.20):
+        super().__init__()
+        h1, h2 = hidden_dims
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, h1),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h1, h2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
 class AMTPredictor:
+
+    def _init_xgb_backend(self, model_path: str):
+        self.model = joblib.load(model_path)
+        self.scaler = None
+        self.device = None
+
+    def _init_mlp_backend(self, model_path: str, scaler_path: str | None):
+        payload = torch.load(model_path, map_location='cpu')
+        input_dim = int(payload['input_dim'])
+        hidden_dims = tuple(payload.get('hidden_dims', [64, 32]))
+        dropout = float(payload.get('dropout', 0.20))
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = _TabularMLP(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout).to(self.device)
+        self.model.load_state_dict(payload['state_dict'])
+        self.model.eval()
+        self.scaler = joblib.load(scaler_path) if scaler_path and os.path.exists(scaler_path) else None
 
     def __init__(
         self,
-        model_path:    str   = config.ML_MODEL_PATH,
-        encoders_path: str   = config.ML_ENCODERS_PATH,
+        model_path: str | None = None,
+        encoders_path: str | None = None,
+        meta_path: str | None = None,
+        scaler_path: str | None = None,
+        backend: str = config.ML_BACKEND_DEFAULT,
         confidence_threshold: float = 0.60,
     ):
-        self.model     = joblib.load(model_path)
+        self.backend = str(backend).lower().strip()
+        if self.backend not in {"xgb", "mlp"}:
+            raise ValueError(f"Unsupported backend='{backend}'. Use 'xgb' or 'mlp'.")
+
+        if self.backend == "xgb":
+            model_path = model_path or config.ML_MODEL_PATH
+            encoders_path = encoders_path or config.ML_ENCODERS_PATH
+            meta_path = meta_path or config.ML_META_PATH
+            self._init_xgb_backend(model_path)
+        else:
+            model_path = model_path or config.ML_MLP_MODEL_PATH
+            encoders_path = encoders_path or config.ML_MLP_ENCODERS_PATH
+            meta_path = meta_path or config.ML_MLP_META_PATH
+            scaler_path = scaler_path or config.ML_MLP_SCALER_PATH
+            self._init_mlp_backend(model_path, scaler_path)
+
         self.threshold = confidence_threshold
 
         # B2 — load serialised encoders (same mapping as training)
-        if os.path.exists(encoders_path):
+        if encoders_path and os.path.exists(encoders_path):
             self.encoders = joblib.load(encoders_path)
         else:
             self.encoders = {}
 
-        meta_path = config.ML_META_PATH
+        self.meta_path = meta_path
         try:
             with open(meta_path) as f:
                 self.meta = json.load(f)
@@ -54,8 +111,7 @@ class AMTPredictor:
     def should_trade(self, signal: dict) -> dict:
         try:
             features = self._build_feature_vector(signal)
-            proba    = self.model.predict_proba([features])[0]
-            conf_pos = float(proba[1])
+            conf_pos = float(self._predict_positive_proba(features))
 
             if conf_pos < self.threshold:
                 return {
@@ -73,6 +129,19 @@ class AMTPredictor:
 
     def score_batch(self, signals: list) -> list:
         return [self.should_trade(s) for s in signals]
+
+    def _predict_positive_proba(self, features: list[float]) -> float:
+        if self.backend == 'xgb':
+            proba = self.model.predict_proba([features])[0]
+            return float(proba[1])
+
+        x = np.array([features], dtype=np.float32)
+        if self.scaler is not None:
+            x = self.scaler.transform(x)
+        xt = torch.tensor(x, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            p = torch.sigmoid(self.model(xt)).detach().cpu().numpy()[0]
+        return float(p)
 
     # ── Internal ───────────────────────────────────────────────────────────────
 

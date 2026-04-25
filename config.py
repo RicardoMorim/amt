@@ -34,9 +34,17 @@ AGGREGATE_SECS      = 1
 
 # ── ML predictor ──────────────────────────────────────────────────────────────
 ML_CONFIDENCE_THRESHOLD = 0.60     # minimum model confidence to fire an alert
+ML_BACKEND_DEFAULT      = "xgb"    # production default stays XGBoost
 ML_MODEL_PATH           = str(ML_DIR / "amt_model.pkl")
 ML_ENCODERS_PATH        = str(ML_DIR / "amt_encoders.pkl")
 ML_META_PATH            = str(ML_DIR / "amt_model_meta.json")
+
+# ── Alternative NN artifacts (FASE 2) ────────────────────────────────────────
+ML_MLP_MODEL_PATH       = str(ML_DIR / "amt_mlp_model.pt")
+ML_MLP_META_PATH        = str(ML_DIR / "amt_mlp_meta.json")
+ML_MLP_ENCODERS_PATH    = str(ML_DIR / "amt_mlp_encoders.pkl")
+ML_MLP_SCALER_PATH      = str(ML_DIR / "amt_mlp_scaler.pkl")
+
 ML_OPTUNA_TRIALS        = 50
 ML_N_CV_SPLITS          = 5
 
