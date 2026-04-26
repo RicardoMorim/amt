@@ -11,7 +11,6 @@
     "market_state_enc",
     "is_composite",
     "timeframe_secs",
-    "hour_utc",
     "day_of_week",
     "false_breakout_flag",
     "price_vs_poc_norm",
@@ -21,15 +20,18 @@
     "dist_to_swing_low_20"
   ],
   "best_params": {
-    "n_estimators": 400,
-    "max_depth": 5,
-    "learning_rate": 0.04,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 10
+    "n_estimators": 165,
+    "max_depth": 7,
+    "learning_rate": 0.036723629102672246,
+    "subsample": 0.8730983199913654,
+    "colsample_bytree": 0.7604910288108077,
+    "min_child_weight": 46,
+    "gamma": 1.9683671725520047,
+    "reg_alpha": 0.45662452708282575,
+    "reg_lambda": 4.399164161632241
   },
-  "cv_mean_auc": NaN,
-  "cv_std_auc": NaN,
+  "cv_mean_auc": 0.9647368384188388,
+  "cv_std_auc": 0.05281723528107581,
   "n_train_samples": 5075037,
   "n_positive": 45803,
   "n_negative": 5029234,
@@ -37,5 +39,7 @@
   "wf_train_fraction": 0.7,
   "wf_val_size": 50000,
   "wf_step": 25000,
-  "wf_n_folds": 202
+  "wf_n_folds": 200,
+  "wf_skipped_single_class": 2,
+  "ablation_drop_hour_utc": true
 }
