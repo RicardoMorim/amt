@@ -21,7 +21,8 @@ def calculate_volume_profile(df, price_col='close', vol_col='volume', value_area
 
     df = df.copy()
     df['price_bucket'] = (df[price_col] / tick_size).round() * tick_size
-    profile = df.groupby('price_bucket')[vol_col].sum().sort_index()
+    df['_profile_volume'] = pd.to_numeric(df[vol_col], errors='coerce').fillna(0.0).abs()
+    profile = df.groupby('price_bucket')['_profile_volume'].sum().sort_index()
 
     if profile.empty:
         return None
@@ -44,18 +45,18 @@ def calculate_volume_profile(df, price_col='close', vol_col='volume', value_area
     volumes = profile.values
 
     while current_vol < target_vol and (up_idx < len(prices) or down_idx >= 0):
-        vol_up = volumes[up_idx] if up_idx < len(prices) else -1
-        vol_down = volumes[down_idx] if down_idx >= 0 else -1
+        can_take_up = up_idx < len(prices)
+        can_take_down = down_idx >= 0
 
-        if vol_up == -1 and vol_down == -1:
+        if not can_take_up and not can_take_down:
             break
 
-        if vol_up >= vol_down:
-            current_vol += vol_up
+        if can_take_up and (not can_take_down or volumes[up_idx] >= volumes[down_idx]):
+            current_vol += float(volumes[up_idx])
             vah = prices[up_idx]
             up_idx += 1
         else:
-            current_vol += vol_down
+            current_vol += float(volumes[down_idx])
             val = prices[down_idx]
             down_idx -= 1
 
@@ -131,15 +132,18 @@ class SessionProfileManager:
         val = poc
 
         while current_vol < target_vol and (up_idx < len(prices) or down_idx >= 0):
-            vol_up = volumes[up_idx] if up_idx < len(prices) else -1
-            vol_down = volumes[down_idx] if down_idx >= 0 else -1
+            can_take_up = up_idx < len(prices)
+            can_take_down = down_idx >= 0
 
-            if vol_up >= vol_down:
-                current_vol += vol_up
+            if not can_take_up and not can_take_down:
+                break
+
+            if can_take_up and (not can_take_down or volumes[up_idx] >= volumes[down_idx]):
+                current_vol += float(volumes[up_idx])
                 vah = prices[up_idx]
                 up_idx += 1
             else:
-                current_vol += vol_down
+                current_vol += float(volumes[down_idx])
                 val = prices[down_idx]
                 down_idx -= 1
 

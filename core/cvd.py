@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 def calculate_cvd(df, price_col='close', vol_col='volume', side_col='side'):
     """
@@ -38,8 +39,9 @@ def calculate_cvd(df, price_col='close', vol_col='volume', side_col='side'):
         direction[price_diff < 0] = -1
         direction[price_diff == 0] = 0
         
-        # Forward fill the zeros to carry over the previous direction
-        direction = direction.replace(0, pd.NA).ffill().fillna(1)
+        # Forward fill unchanged ticks with previous direction
+        # Use NaN + explicit float cast to avoid pandas downcasting FutureWarning.
+        direction = direction.replace(0, np.nan).ffill().fillna(1.0).astype('float64')
         
     df['delta'] = df[vol_col] * direction
     df['cvd'] = df['delta'].cumsum()
