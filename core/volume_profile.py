@@ -20,8 +20,8 @@ def calculate_volume_profile(df, price_col='close', vol_col='volume', value_area
         return None
 
     df = df.copy()
-    df['price_bucket'] = (df[price_col] / tick_size).round() * tick_size
-    df['_profile_volume'] = pd.to_numeric(df[vol_col], errors='coerce').fillna(0.0).abs()
+    df.loc[:, 'price_bucket'] = (df[price_col] / tick_size).round() * tick_size
+    df.loc[:, '_profile_volume'] = pd.to_numeric(df[vol_col], errors='coerce').fillna(0.0).abs()
     profile = df.groupby('price_bucket')['_profile_volume'].sum().sort_index()
 
     if profile.empty:

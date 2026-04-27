@@ -19,31 +19,28 @@ def calculate_cvd(df, price_col='close', vol_col='volume', side_col='side'):
     df = df.copy()
     
     if side_col in df.columns:
-        # Determine direction based on string 'buy'/'sell' or integer 1/-1
+        # Determine direction based on string 'buy'/'sell' or integer 1/-1.
         if df[side_col].dtype == object:
-            direction = df[side_col].apply(lambda x: 1 if str(x).lower() == 'buy' else -1)
+            direction = df[side_col].astype(str).str.lower().map(lambda x: 1.0 if x == 'buy' else -1.0)
         else:
-            direction = np.where(df[side_col] > 0, 1, -1)
+            direction = pd.Series(np.where(df[side_col] > 0, 1.0, -1.0), index=df.index, dtype='float64')
     else:
-        # Tick test approximation: 
-        # Valid when exact order book side is unknown.
+        # Tick test approximation:
         # If price > prev_price -> +1 (buy)
         # If price < prev_price -> -1 (sell)
         # If price == prev_price -> previous tick direction
         price_diff = df[price_col].diff()
-        
-        # 1 for positive diff, -1 for negative, 0 for no change
-        # Pandas 2.x efficient assignment:
-        direction = pd.Series(index=df.index, dtype='float64')
-        direction[price_diff > 0] = 1
-        direction[price_diff < 0] = -1
-        direction[price_diff == 0] = 0
-        
-        # Forward fill unchanged ticks with previous direction
-        # Use NaN + explicit float cast to avoid pandas downcasting FutureWarning.
-        direction = direction.replace(0, np.nan).ffill().fillna(1.0).astype('float64')
-        
-    df['delta'] = df[vol_col] * direction
-    df['cvd'] = df['delta'].cumsum()
+        direction = pd.Series(
+            np.select(
+                [price_diff > 0, price_diff < 0, price_diff == 0],
+                [1.0, -1.0, 0.0],
+                default=np.nan,
+            ),
+            index=df.index,
+            dtype='float64',
+        ).replace(0.0, np.nan).ffill().fillna(1.0)
+
+    df.loc[:, 'delta'] = df[vol_col].astype(float) * direction.astype(float)
+    df.loc[:, 'cvd'] = df['delta'].cumsum()
     
     return df
