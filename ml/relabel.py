@@ -9,9 +9,12 @@ Usage examples:
     python -m ml.relabel --symbol btcusdt --timeframe-secs 900 --only-unlabeled
 """
 
-from __future__ import annotations
-
+import sys
 import argparse
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
 from ml.labeler import LabelerConfig, SameCandlePolicy, relabel_sqlite
@@ -24,8 +27,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeframe-secs", type=int, default=None, help="Optional timeframe filter")
 
     p.add_argument("--horizon-candles", type=int, default=8, help="Forward horizon in candles")
-    p.add_argument("--tp-pct", type=float, default=0.005, help="Take-profit percentage (0.005 = 0.5%)")
-    p.add_argument("--sl-pct", type=float, default=0.003, help="Stop-loss percentage (0.003 = 0.3%)")
+    p.add_argument("--tp-pct", type=float, default=0.005, help="Take-profit percentage (0.005 = 0.5%%)")
+    p.add_argument("--sl-pct", type=float, default=0.003, help="Stop-loss percentage (0.003 = 0.3%%)")
     p.add_argument("--fee-pct", type=float, default=0.0004, help="Per-side fee percentage")
     p.add_argument("--slippage-pct", type=float, default=0.0002, help="Per-side slippage percentage")
     p.add_argument(

@@ -28,7 +28,7 @@ FLUSH_EVERY             = 200
 
 # ── Historical Runner ─────────────────────────────────────────────────────────
 BACKFILL_START      = "2020-01-01"
-BACKFILL_END        = "2026-03-29"
+BACKFILL_END        = "2026-04-29"
 PARALLEL_DOWNLOADS  = 10
 AGGREGATE_SECS      = 1
 

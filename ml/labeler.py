@@ -61,7 +61,7 @@ class SameCandlePolicy(str, Enum):
 
 @dataclass(frozen=True)
 class LabelerConfig:
-    horizon_candles: int = 8
+    horizon_candles: int = 25
     tp_pct: float = 0.005            # 0.50%
     sl_pct: float = 0.003            # 0.30%
     fee_pct: float = 0.0004          # 0.04% each side
@@ -368,10 +368,7 @@ class SQLiteSignalLabeler:
     def label_signals(self, symbol: Optional[str] = None, timeframe_secs: Optional[int] = None) -> dict[str, int]:
         self.ensure_schema()
 
-        signals_df = self.load_signals(symbol=symbol)
-        if signals_df.empty:
-            return {"processed": 0, "WIN": 0, "LOSS": 0, "TIMEOUT": 0, "SKIP": 0}
-
+        # Load ALL candles once (221k rows is manageable in RAM)
         candles_df = self.load_candles(symbol=symbol, timeframe_secs=timeframe_secs)
         if candles_df.empty:
             raise RuntimeError(
@@ -385,65 +382,89 @@ class SQLiteSignalLabeler:
             candles_groups[(str(sym).lower(), int(tf))] = grp.sort_values("timestamp")
 
         stats = {"processed": 0, "WIN": 0, "LOSS": 0, "TIMEOUT": 0, "SKIP": 0}
-        updates = []
+        
+        # Prepare signal query for chunked loading
+        where = []
+        params: list[Any] = []
+        if not self.config.relabel_all:
+            where.append("COALESCE(is_labeled, 0) = 0")
+        if symbol:
+            where.append("LOWER(asset) = LOWER(?)")
+            params.append(symbol)
 
-        for _, sig in signals_df.iterrows():
-            sig_symbol = str(sig.get("asset", "")).lower()
-            sig_tf = int(sig.get("timeframe_secs", 0) or 0)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        query = f"""
+            SELECT id, timestamp_event, asset, timeframe_secs, direction, trigger_price
+            FROM signals
+            {where_sql}
+        """
 
-            # Prefer exact (symbol,timeframe), then fallback by symbol only
-            cdf = candles_groups.get((sig_symbol, sig_tf))
-            if cdf is None:
-                fallback = [g for (s, _tf), g in candles_groups.items() if s == sig_symbol]
-                cdf = fallback[0] if fallback else pd.DataFrame()
+        # Use tqdm for progress if available
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            def tqdm(iterable, **kwargs): return iterable
 
-            outcome = self.label_one(sig, cdf)
-            stats["processed"] += 1
-            stats[outcome.status.value] += 1
+        chunk_size = 25000
+        print(f"Starting chunked labeling (batch size: {chunk_size})...")
+        
+        # Total count for progress bar
+        total_signals = self.conn.execute(f"SELECT count(*) FROM signals {where_sql}", params).fetchone()[0]
+        pbar = tqdm(total=total_signals, desc="Labeling Signals")
 
-            updates.append(
-                (
-                    outcome.label_win_pct,
-                    outcome.label_loss_pct,
-                    outcome.is_labeled,
-                    outcome.status.value,
-                    outcome.reason,
-                    outcome.exit_price,
-                    outcome.exit_time,
-                    int(self.config.horizon_candles),
-                    float(self.config.tp_pct),
-                    float(self.config.sl_pct),
-                    float(self.config.fee_pct),
-                    float(self.config.slippage_pct),
-                    outcome.timeout_return_pct,
-                    outcome.ambiguity_flag,
-                    outcome.signal_id,
+        for signals_chunk in pd.read_sql_query(query, self.conn, params=params, chunksize=chunk_size):
+            updates = []
+            for _, sig in signals_chunk.iterrows():
+                sig_symbol = str(sig.get("asset", "")).lower()
+                sig_tf = int(sig.get("timeframe_secs", 0) or 0)
+
+                cdf = candles_groups.get((sig_symbol, sig_tf))
+                if cdf is None:
+                    fallback = [g for (s, _tf), g in candles_groups.items() if s == sig_symbol]
+                    cdf = fallback[0] if fallback else pd.DataFrame()
+
+                outcome = self.label_one(sig, cdf)
+                stats["processed"] += 1
+                stats[outcome.status.value] += 1
+
+                updates.append(
+                    (
+                        outcome.label_win_pct,
+                        outcome.label_loss_pct,
+                        outcome.is_labeled,
+                        outcome.status.value,
+                        outcome.reason,
+                        outcome.exit_price,
+                        outcome.exit_time,
+                        int(self.config.horizon_candles),
+                        float(self.config.tp_pct),
+                        float(self.config.sl_pct),
+                        float(self.config.fee_pct),
+                        float(self.config.slippage_pct),
+                        outcome.timeout_return_pct,
+                        outcome.ambiguity_flag,
+                        outcome.signal_id,
+                    )
                 )
-            )
 
-        self.conn.executemany(
-            """
-            UPDATE signals
-            SET
-                label_win_pct = ?,
-                label_loss_pct = ?,
-                is_labeled = ?,
-                label_status = ?,
-                label_reason = ?,
-                label_exit_price = ?,
-                label_exit_time = ?,
-                label_horizon_candles = ?,
-                label_tp_pct = ?,
-                label_sl_pct = ?,
-                label_fee_pct = ?,
-                label_slippage_pct = ?,
-                label_timeout_return_pct = ?,
-                label_ambiguity_flag = ?
-            WHERE id = ?
-            """,
-            updates,
-        )
-        self.conn.commit()
+            # Bulk update current batch
+            self.conn.executemany(
+                """
+                UPDATE signals
+                SET
+                    label_win_pct = ?, label_loss_pct = ?, is_labeled = ?, label_status = ?,
+                    label_reason = ?, label_exit_price = ?, label_exit_time = ?,
+                    label_horizon_candles = ?, label_tp_pct = ?, label_sl_pct = ?,
+                    label_fee_pct = ?, label_slippage_pct = ?, label_timeout_return_pct = ?,
+                    label_ambiguity_flag = ?
+                WHERE id = ?
+                """,
+                updates,
+            )
+            self.conn.commit()
+            pbar.update(len(signals_chunk))
+
+        pbar.close()
         return stats
 
 
