@@ -34,9 +34,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 import logging
+import math
 import multiprocessing
 import sqlite3
 
@@ -55,7 +55,7 @@ class LabelStatus(str, Enum):
 
 class SameCandlePolicy(str, Enum):
     """How to resolve TP+SL touched in the same candle."""
-    SL_FIRST = "SL_FIRST"   # conservative default
+    SL_FIRST = "SL_FIRST"
     TP_FIRST = "TP_FIRST"
     SKIP = "SKIP"
 
@@ -63,8 +63,8 @@ class SameCandlePolicy(str, Enum):
 @dataclass(frozen=True)
 class LabelerConfig:
     horizon_candles: int = 25
-    tp_pct: float = 0.007
-    sl_pct: float = 0.0025
+    tp_pct: float = 0.009
+    sl_pct: float = 0.003
     fee_pct: float = 0.0004
     slippage_pct: float = 0.0002
     same_candle_policy: SameCandlePolicy = SameCandlePolicy.TP_FIRST
@@ -137,8 +137,8 @@ def _label_one_raw(
     sig_id: str,
     direction: Optional[str],
     entry: float,
-    sig_ts_ns: int,                 # UTC nanoseconds (int64)
-    ts_ns_arr: np.ndarray,          # int64 array of candle timestamps
+    sig_ts_ns: int,
+    ts_ns_arr: np.ndarray,
     high_arr: np.ndarray,
     low_arr: np.ndarray,
     close_arr: np.ndarray,
@@ -150,16 +150,13 @@ def _label_one_raw(
     config_min_forward: int,
 ) -> tuple:
     """
-    Pure-function label logic operating on raw numpy arrays.
-    Uses searchsorted for O(log n) candle lookup instead of O(n) .loc filter.
+    Pure-function label logic on raw numpy arrays.
+    O(log n) candle lookup via searchsorted.
     Returns a flat tuple ready for executemany.
     """
-    # O(log n) binary search for first candle strictly after signal timestamp
     start_idx = int(np.searchsorted(ts_ns_arr, sig_ts_ns, side="right"))
     end_idx = min(start_idx + config_horizon, len(ts_ns_arr))
     n_forward = end_idx - start_idx
-
-    _SKIP = "SKIP"
 
     if direction is None or entry <= 0:
         return (0.0, 0.0, 0, "SKIP", "invalid_direction_or_entry",
@@ -188,20 +185,20 @@ def _label_one_raw(
     exit_ts_ns = int(ts_ns_arr[end_idx - 1])
 
     for i in range(start_idx, end_idx):
-        high = float(high_arr[i])
-        low = float(low_arr[i])
+        high  = float(high_arr[i])
+        low   = float(low_arr[i])
         close = float(close_arr[i])
         c_ts_ns = int(ts_ns_arr[i])
 
         if direction == "LONG":
-            fav = (high - entry) / entry
-            adv = (low - entry) / entry
+            fav    = (high - entry) / entry
+            adv    = (low  - entry) / entry
             tp_hit = high >= tp_level
-            sl_hit = low <= sl_level
+            sl_hit = low  <= sl_level
         else:
-            fav = (entry - low) / entry
-            adv = (entry - high) / entry
-            tp_hit = low <= tp_level
+            fav    = (entry - low)  / entry
+            adv    = (entry - high) / entry
+            tp_hit = low  <= tp_level
             sl_hit = high >= sl_level
 
         if fav > max_fav_pct:
@@ -234,12 +231,15 @@ def _label_one_raw(
 
     timeout_return_pct = 0.0
     if status == "TIMEOUT":
-        timeout_return_pct = _directional_return_pct(
-            direction, entry, float(exit_price)) - config_roundtrip_cost
+        timeout_return_pct = (
+            _directional_return_pct(direction, entry, float(exit_price))
+            - config_roundtrip_cost
+        )
 
-    # Convert exit_ts_ns back to ISO string
-    exit_time = pd.Timestamp(exit_ts_ns, unit="ns",
-                             tz="UTC").isoformat() if exit_ts_ns else None
+    exit_time = (
+        pd.Timestamp(exit_ts_ns, unit="ns", tz="UTC").isoformat()
+        if exit_ts_ns else None
+    )
 
     is_labeled = 0 if status == "SKIP" else 1
 
@@ -253,19 +253,17 @@ def _label_one_raw(
 
 
 # ---------------------------------------------------------------------------
-# Worker function (runs in a separate process)
+# Worker function (top-level so it is picklable by ProcessPoolExecutor)
 # ---------------------------------------------------------------------------
 
 def _label_group_worker(args: tuple) -> tuple[list[tuple], dict[str, int]]:
     """
-    Labels all signals for one (symbol, timeframe) group.
-    Called by ProcessPoolExecutor — must be picklable (top-level function).
-
+    Labels a chunk of signals against shared candle arrays.
     Returns (updates_list, stats_dict).
     """
     (
-        signals_records,   # list of dicts
-        ts_ns_arr,         # np.ndarray int64
+        signals_records,
+        ts_ns_arr,
         high_arr,
         low_arr,
         close_arr,
@@ -277,8 +275,8 @@ def _label_group_worker(args: tuple) -> tuple[list[tuple], dict[str, int]]:
         config_min_forward,
     ) = args
 
-    updates = []
-    stats = {"WIN": 0, "LOSS": 0, "TIMEOUT": 0, "SKIP": 0}
+    updates: list[tuple] = []
+    stats: dict[str, int] = {"WIN": 0, "LOSS": 0, "TIMEOUT": 0, "SKIP": 0}
 
     for sig in signals_records:
         direction = _normalize_direction(sig.get("direction"))
@@ -286,8 +284,7 @@ def _label_group_worker(args: tuple) -> tuple[list[tuple], dict[str, int]]:
         sig_id = str(sig["id"])
 
         try:
-            sig_ts_ns = int(pd.to_datetime(
-                sig["timestamp_event"], utc=True).value)
+            sig_ts_ns = int(pd.to_datetime(sig["timestamp_event"], utc=True).value)
         except Exception:
             updates.append((
                 0.0, 0.0, 0, "SKIP", "invalid_timestamp",
@@ -314,7 +311,7 @@ def _label_group_worker(args: tuple) -> tuple[list[tuple], dict[str, int]]:
             config_min_forward=config_min_forward,
         )
         updates.append(row)
-        stats[row[3]] = stats.get(row[3], 0) + 1  # row[3] is status string
+        stats[row[3]] = stats.get(row[3], 0) + 1
 
     return updates, stats
 
@@ -324,6 +321,9 @@ def _label_group_worker(args: tuple) -> tuple[list[tuple], dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 class SQLiteSignalLabeler:
+    # Minimum signals per chunk sent to a worker
+    CHUNK_SIZE = 50_000
+
     def __init__(
         self,
         conn: sqlite3.Connection,
@@ -332,9 +332,7 @@ class SQLiteSignalLabeler:
     ):
         self.conn = conn
         self.config = config
-        # Default: leave one core free for the OS / SQLite writes
-        self.n_workers = n_workers or max(
-            1, (multiprocessing.cpu_count() or 2) - 1)
+        self.n_workers = n_workers or max(1, (multiprocessing.cpu_count() or 2) - 1)
 
     # ------------------------------------------------------------------
     # Schema / IO
@@ -391,17 +389,15 @@ class SQLiteSignalLabeler:
         if df.empty:
             return df
 
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"], utc=True, errors="coerce")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
         return df
 
     # ------------------------------------------------------------------
-    # label_one kept for backwards compat / unit tests
+    # label_one — backwards compat / unit tests
     # ------------------------------------------------------------------
 
     def label_one(self, signal_row: pd.Series, candles_df: pd.DataFrame) -> LabelOutcome:
-        """Label a single signal. Uses searchsorted internally."""
         sig_id = str(signal_row["id"])
         direction = _normalize_direction(signal_row.get("direction"))
         entry = float(signal_row.get("trigger_price", 0.0) or 0.0)
@@ -417,10 +413,10 @@ class SQLiteSignalLabeler:
                 timeout_return_pct=0.0, ambiguity_flag=0,
             )
 
-        ts_ns_arr = candles_df["timestamp"].values.astype("int64")
-        high_arr = candles_df["high"].values.astype("float64")
-        low_arr = candles_df["low"].values.astype("float64")
-        close_arr = candles_df["close"].values.astype("float64")
+        ts_ns_arr  = candles_df["timestamp"].values.astype("int64")
+        high_arr   = candles_df["high"].values.astype("float64")
+        low_arr    = candles_df["low"].values.astype("float64")
+        close_arr  = candles_df["close"].values.astype("float64")
 
         row = _label_one_raw(
             sig_id=sig_id, direction=direction, entry=entry,
@@ -440,16 +436,10 @@ class SQLiteSignalLabeler:
             "TIMEOUT": LabelStatus.TIMEOUT, "SKIP": LabelStatus.SKIP,
         }
         return LabelOutcome(
-            signal_id=sig_id,
-            status=status_map[row[3]],
-            reason=row[4],
-            is_labeled=row[2],
-            label_win_pct=row[0],
-            label_loss_pct=row[1],
-            exit_price=row[5],
-            exit_time=row[6],
-            timeout_return_pct=row[10],
-            ambiguity_flag=row[11],
+            signal_id=sig_id, status=status_map[row[3]], reason=row[4],
+            is_labeled=row[2], label_win_pct=row[0], label_loss_pct=row[1],
+            exit_price=row[5], exit_time=row[6],
+            timeout_return_pct=row[10], ambiguity_flag=row[11],
         )
 
     # ------------------------------------------------------------------
@@ -463,15 +453,14 @@ class SQLiteSignalLabeler:
     ) -> dict[str, int]:
         self.ensure_schema()
 
-        candles_df = self.load_candles(
-            symbol=symbol, timeframe_secs=timeframe_secs)
+        candles_df = self.load_candles(symbol=symbol, timeframe_secs=timeframe_secs)
         if candles_df.empty:
             raise RuntimeError(
                 "No candles available in SQLite table `candles`. "
                 "Run historical backfill with candle persistence first."
             )
 
-        # Build per-group numpy arrays once (avoids repeated DataFrame slicing in workers)
+        # Build per-(symbol, timeframe) numpy arrays
         candles_groups: dict[tuple[str, int], dict] = {}
         for (sym, tf), grp in candles_df.groupby(["symbol", "timeframe_secs"], sort=False):
             grp_sorted = grp.sort_values("timestamp")
@@ -482,7 +471,7 @@ class SQLiteSignalLabeler:
                 "close":  grp_sorted["close"].values.astype("float64"),
             }
 
-        # Load all signals into memory (grouped by asset+timeframe)
+        # Load signals
         where, params = [], []
         if not self.config.relabel_all:
             where.append("COALESCE(is_labeled, 0) = 0")
@@ -498,42 +487,45 @@ class SQLiteSignalLabeler:
         signals_df = pd.read_sql_query(query, self.conn, params=params)
 
         total = len(signals_df)
-        print(
-            f"Total signals to label: {total:,}  |  workers: {self.n_workers}")
+        print(f"Total signals to label: {total:,}  |  workers: {self.n_workers}")
 
-        # Group signals by (asset, timeframe) and build worker argument tuples
-        worker_args = []
+        # ----------------------------------------------------------------
+        # Build worker_args — split every group into chunks of CHUNK_SIZE
+        # so we always have >= n_workers jobs even with a single symbol/tf.
+        # ----------------------------------------------------------------
+        worker_args: list[tuple] = []
+
         for (sym, tf), sig_grp in signals_df.groupby(
             [signals_df["asset"].str.lower(), signals_df["timeframe_secs"]], sort=False
         ):
             key = (str(sym).lower(), int(tf))
             arrays = candles_groups.get(key)
             if arrays is None:
-                # Try symbol-only fallback
-                fallback = next(
-                    (v for (s, _), v in candles_groups.items()
-                     if s == str(sym).lower()),
+                arrays = next(
+                    (v for (s, _), v in candles_groups.items() if s == str(sym).lower()),
                     None,
                 )
-                if fallback is None:
-                    logger.warning(
-                        "No candles for (%s, %s) — all SKIP", sym, tf)
-                    continue
-                arrays = fallback
+            if arrays is None:
+                logger.warning("No candles for (%s, %s) — all SKIP", sym, tf)
+                continue
 
-            worker_args.append((
-                sig_grp.to_dict(orient="records"),
-                arrays["ts_ns"],
-                arrays["high"],
-                arrays["low"],
-                arrays["close"],
-                self.config.horizon_candles,
-                self.config.tp_pct,
-                self.config.sl_pct,
-                self.config.roundtrip_cost_pct,
-                self.config.same_candle_policy.value,
-                self.config.min_forward_candles_required,
-            ))
+            records = sig_grp.to_dict(orient="records")
+            # Split into chunks so multiprocessing has enough tasks
+            for i in range(0, len(records), self.CHUNK_SIZE):
+                chunk = records[i: i + self.CHUNK_SIZE]
+                worker_args.append((
+                    chunk,
+                    arrays["ts_ns"],
+                    arrays["high"],
+                    arrays["low"],
+                    arrays["close"],
+                    self.config.horizon_candles,
+                    self.config.tp_pct,
+                    self.config.sl_pct,
+                    self.config.roundtrip_cost_pct,
+                    self.config.same_candle_policy.value,
+                    self.config.min_forward_candles_required,
+                ))
 
         stats = {"processed": 0, "WIN": 0, "LOSS": 0, "TIMEOUT": 0, "SKIP": 0}
 
@@ -553,21 +545,24 @@ class SQLiteSignalLabeler:
             WHERE id = ?
         """
 
-        use_mp = self.n_workers > 1 and len(worker_args) > 1
+        n_jobs = len(worker_args)
+        use_mp = self.n_workers > 1 and n_jobs > 1
+        print(
+            f"{'Launching ' + str(self.n_workers) + ' worker processes' if use_mp else 'Running single-threaded'}"
+            f"  ({n_jobs} chunks of ~{self.CHUNK_SIZE:,} signals each)"
+        )
+
+        pbar = tqdm(total=total, desc="Labeling", unit="sig")
 
         if use_mp:
             from concurrent.futures import ProcessPoolExecutor, as_completed
-            print(f"Launching {self.n_workers} worker processes...")
-            pbar = tqdm(total=total, desc="Labeling", unit="sig")
             with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
-                futures = {pool.submit(
-                    _label_group_worker, arg): arg for arg in worker_args}
+                futures = {pool.submit(_label_group_worker, arg): arg for arg in worker_args}
                 for fut in as_completed(futures):
                     try:
                         updates, grp_stats = fut.result()
                     except Exception as exc:
-                        logger.error(
-                            "Worker failed: %s — falling back to SKIP for group", exc)
+                        logger.error("Worker failed: %s", exc)
                         continue
 
                     self.conn.executemany(UPDATE_SQL, updates)
@@ -578,11 +573,7 @@ class SQLiteSignalLabeler:
                     for k in ("WIN", "LOSS", "TIMEOUT", "SKIP"):
                         stats[k] += grp_stats.get(k, 0)
                     pbar.update(n)
-            pbar.close()
         else:
-            # Single-threaded fallback (e.g. only 1 group or 1 CPU)
-            print("Running single-threaded (1 group or 1 CPU)...")
-            pbar = tqdm(total=total, desc="Labeling", unit="sig")
             for arg in worker_args:
                 updates, grp_stats = _label_group_worker(arg)
                 self.conn.executemany(UPDATE_SQL, updates)
@@ -592,8 +583,8 @@ class SQLiteSignalLabeler:
                 for k in ("WIN", "LOSS", "TIMEOUT", "SKIP"):
                     stats[k] += grp_stats.get(k, 0)
                 pbar.update(n)
-            pbar.close()
 
+        pbar.close()
         return stats
 
 
@@ -607,10 +598,8 @@ def relabel_sqlite(
     """Convenience entry point for scripts/CLI."""
     conn = sqlite3.connect(db_path)
     try:
-        labeler = SQLiteSignalLabeler(
-            conn=conn, config=config, n_workers=n_workers)
-        stats = labeler.label_signals(
-            symbol=symbol, timeframe_secs=timeframe_secs)
+        labeler = SQLiteSignalLabeler(conn=conn, config=config, n_workers=n_workers)
+        stats = labeler.label_signals(symbol=symbol, timeframe_secs=timeframe_secs)
         logger.info("Labeling complete: %s", stats)
         return stats
     finally:
