@@ -67,7 +67,7 @@ class LabelerConfig:
     sl_pct: float = 0.003
     fee_pct: float = 0.0004
     slippage_pct: float = 0.0002
-    same_candle_policy: SameCandlePolicy = SameCandlePolicy.TP_FIRST
+    same_candle_policy: SameCandlePolicy = SameCandlePolicy.SL_FIRST
     min_forward_candles_required: int = 1
     relabel_all: bool = True
 

@@ -92,6 +92,13 @@ def maybe_retrain(
         from ml.trainer import train
         train(db_path)
 
+        try:
+            logger.info('Running post-training heuristic optimization...')
+            from ml.hyper_optimizer import optimize_heuristics
+            optimize_heuristics(db_path)
+        except Exception as e:
+            logger.error(f'Heuristic optimization failed: {e}')
+
         log['last_n_samples'] = current_n
         log['runs'].append({
             'timestamp': datetime.utcnow().isoformat(),
