@@ -62,13 +62,13 @@ class SameCandlePolicy(str, Enum):
 @dataclass(frozen=True)
 class LabelerConfig:
     horizon_candles: int = 25
-    tp_pct: float = 0.005            # 0.50%
-    sl_pct: float = 0.003            # 0.30%
-    fee_pct: float = 0.0004          # 0.04% each side
-    slippage_pct: float = 0.0002     # 0.02% each side
+    tp_pct: float = 0.009        # 0.90%  → net +0.78%
+    sl_pct: float = 0.003        # 0.30%  → net -0.42%
+    # R:R líquido = 0.78 / 0.42 = 1.86:1
+    # Break-even win rate = 0.42 / (0.78 + 0.42) = 35%
+    fee_pct: float = 0.0004
+    slippage_pct: float = 0.0002
     same_candle_policy: SameCandlePolicy = SameCandlePolicy.SL_FIRST
-    min_forward_candles_required: int = 1
-    relabel_all: bool = True
 
     @property
     def roundtrip_cost_pct(self) -> float:
