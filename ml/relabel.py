@@ -5,8 +5,9 @@ CLI wrapper for robust, deterministic historical labeling.
 
 Usage examples:
     python -m ml.relabel
-    python -m ml.relabel --horizon-candles 8 --tp-pct 0.005 --sl-pct 0.003
+    python -m ml.relabel --horizon-candles 25 --tp-pct 0.009 --sl-pct 0.003 --same-candle-policy TP_FIRST
     python -m ml.relabel --symbol btcusdt --timeframe-secs 900 --only-unlabeled
+    python -m ml.relabel --workers 4
 """
 
 import sys
@@ -26,15 +27,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--symbol", default=None, help="Optional symbol filter (e.g. btcusdt)")
     p.add_argument("--timeframe-secs", type=int, default=None, help="Optional timeframe filter")
 
-    p.add_argument("--horizon-candles", type=int, default=8, help="Forward horizon in candles")
-    p.add_argument("--tp-pct", type=float, default=0.005, help="Take-profit percentage (0.005 = 0.5%%)")
+    p.add_argument("--horizon-candles", type=int, default=25, help="Forward horizon in candles")
+    p.add_argument("--tp-pct", type=float, default=0.009, help="Take-profit percentage (0.009 = 0.9%%)")
     p.add_argument("--sl-pct", type=float, default=0.003, help="Stop-loss percentage (0.003 = 0.3%%)")
     p.add_argument("--fee-pct", type=float, default=0.0004, help="Per-side fee percentage")
     p.add_argument("--slippage-pct", type=float, default=0.0002, help="Per-side slippage percentage")
     p.add_argument(
         "--same-candle-policy",
         type=str,
-        default="SL_FIRST",
+        default="TP_FIRST",
         choices=[p.value for p in SameCandlePolicy],
         help="Resolution when TP and SL are touched in the same candle",
     )
@@ -44,6 +45,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Minimum forward candles required; otherwise row becomes SKIP",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes (default: cpu_count - 1)",
     )
     return p
 
@@ -63,7 +70,7 @@ def main() -> None:
     )
 
     print("=" * 70)
-    print("🏷️  AMT Robust Relabel")
+    print("AMT Robust Relabel")
     print("=" * 70)
     print(f"DB                : {args.db_path}")
     print(f"Symbol filter     : {args.symbol or '(all)'}")
@@ -73,6 +80,7 @@ def main() -> None:
     print(f"Fees / Slippage   : {cfg.fee_pct:.4%} / {cfg.slippage_pct:.4%} (per side)")
     print(f"Same candle policy: {cfg.same_candle_policy.value}")
     print(f"Relabel all       : {cfg.relabel_all}")
+    print(f"Workers           : {args.workers or 'auto (cpu_count - 1)'}")
     print("-" * 70)
 
     stats = relabel_sqlite(
@@ -80,6 +88,7 @@ def main() -> None:
         config=cfg,
         symbol=args.symbol,
         timeframe_secs=args.timeframe_secs,
+        n_workers=args.workers,
     )
 
     print("Result:")
@@ -88,6 +97,9 @@ def main() -> None:
     print(f"  LOSS    : {stats['LOSS']}")
     print(f"  TIMEOUT : {stats['TIMEOUT']}")
     print(f"  SKIP    : {stats['SKIP']}")
+    win_total = stats['WIN'] + stats['LOSS']
+    if win_total > 0:
+        print(f"  WIN rate: {stats['WIN'] / win_total:.1%}  (ex-TIMEOUT/SKIP)")
     print("=" * 70)
 
 
