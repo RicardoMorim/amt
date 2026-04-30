@@ -17,7 +17,7 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -101,7 +101,7 @@ def maybe_retrain(
 
         log['last_n_samples'] = current_n
         log['runs'].append({
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'n_samples': current_n,
             'reason':    'force' if force else f'growth>={growth_threshold:.0%}',
         })
