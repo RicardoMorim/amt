@@ -29,7 +29,7 @@ from .contracts import (
 def df_to_candles(df: pd.DataFrame, symbol: str = "", timeframe_secs: int = 60) -> List[Candle]:
     """Convert an OHLCV DataFrame to a list of Candle objects."""
     candles = []
-    for _, row in df.iterrows():
+    for row in df.to_dict('records'):
         try:
             candle = Candle.from_pandas_row(row, symbol=symbol, timeframe_secs=timeframe_secs)
             candles.append(candle)
@@ -42,13 +42,9 @@ def df_to_candles(df: pd.DataFrame, symbol: str = "", timeframe_secs: int = 60) 
 def df_to_signals(df: pd.DataFrame) -> List[AMTSignal]:
     """Convert a DataFrame of signal records to AMTSignal objects."""
     signals = []
-    for _, row in df.iterrows():
+    for row in df.to_dict('records'):
         try:
-            # Try legacy format first (dict-like), then typed dict
-            if isinstance(row, dict):
-                sig = AMTSignal.from_legacy_dict(row)
-            else:
-                sig = AMTSignal.from_legacy_dict(row.to_dict())
+            sig = AMTSignal.from_legacy_dict(row)
             signals.append(sig)
         except Exception:
             continue
@@ -58,9 +54,8 @@ def df_to_signals(df: pd.DataFrame) -> List[AMTSignal]:
 def df_to_predictions(df: pd.DataFrame) -> List[KronosPrediction]:
     """Convert a DataFrame of prediction records to KronosPrediction objects."""
     preds = []
-    for _, row in df.iterrows():
+    for d in df.to_dict('records'):
         try:
-            d = row.to_dict() if not isinstance(row, dict) else row
             preds.append(KronosPrediction.from_dict(d))
         except Exception:
             continue
