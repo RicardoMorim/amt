@@ -149,7 +149,7 @@ def sqlite_row_to_prediction(row: Dict[str, Any]) -> Optional[KronosPrediction]:
         return None
 
 
-def _sqlite_ts_to_iso(row: sqlite3.Row, ts_col: str = "timestamp") -> str:
+def _sqlite_ts_to_iso(row: Dict[str, Any], ts_col: str = "timestamp") -> str:
     """Convert various SQLite timestamp formats to ISO-8601 string."""
     raw = row.get(ts_col)
     if raw is None:
@@ -162,7 +162,7 @@ def _sqlite_ts_to_iso(row: sqlite3.Row, ts_col: str = "timestamp") -> str:
         if ts_num > 1e12:
             ts_num /= 1000
         return datetime.fromtimestamp(ts_num, tz=timezone.utc).isoformat()
-    except (ValueError, TypeError, OSError):
+    except (ValueError, TypeError, OSError, OverflowError):
         pass
 
     # Otherwise treat as string
