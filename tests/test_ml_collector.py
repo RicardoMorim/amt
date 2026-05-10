@@ -79,13 +79,13 @@ def test_label_all_pending(collector):
         for r in results:
             assert r[1] == 1
             if r[0] == 'sig_l':
-                assert r[2] == 110.0
-                assert r[3] == 90.0
+                assert abs(r[2] - 110.0) < 1e-6
+                assert abs(r[3] - 90.0) < 1e-6
                 assert abs(r[4] - 0.1) < 1e-6
                 assert abs(r[5] - (-0.1)) < 1e-6
             elif r[0] == 'sig_s':
-                assert r[2] == 220.0
-                assert r[3] == 180.0
+                assert abs(r[2] - 220.0) < 1e-6
+                assert abs(r[3] - 180.0) < 1e-6
                 assert abs(r[4] - 0.1) < 1e-6
                 assert abs(r[5] - (-0.1)) < 1e-6
     else:
