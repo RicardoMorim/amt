@@ -3,6 +3,9 @@ import numpy as np
 import config
 import os
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Self-Learning Logic: Load optimized heuristcs if they exist
 vol_multiplier = config.BREAKOUT_VOL_MULTIPLIER
@@ -17,8 +20,10 @@ if os.path.exists(optimized_path):
                 vol_multiplier = opts['vol_multiplier']
             if 'min_body_ratio' in opts:
                 min_body_ratio = opts['min_body_ratio']
-    except Exception as e:
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        logger.warning(f"Failed to load optimized heuristics: {e}")
 
 
 def detect_balance_breakout(current_candle, cvd_data, profile_data, lookback_df):
