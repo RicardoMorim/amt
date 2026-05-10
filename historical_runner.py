@@ -492,15 +492,15 @@ async def run_historical_backfill(
                 session.profile_mgr.reset()
 
                 t_stream_start = time.time()
-                trades_list = df.to_dict('records')
-                for trade in trades_list:
+                for trade in df.itertuples(index=False):
                     session.on_trade(trade)
                 t_stream = time.time() - t_stream_start
 
+                trade_count = len(df)
                 with total_trades_lock:
-                    total_trades += len(trades_list)
+                    total_trades += trade_count
 
-                logger.debug(f"    [{date_str}] ⏳ Streamed {len(trades_list):,} trades in {t_stream:.2f}s")
+                logger.debug(f"    [{date_str}] ⏳ Streamed {trade_count:,} trades in {t_stream:.2f}s")
 
                 t_label_start = time.time()
                 df_indexed = df.set_index('timestamp')
