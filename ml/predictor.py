@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import sys
 import json
 import os
@@ -31,6 +32,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 class _TabularMLP(nn.Module):
@@ -176,8 +179,8 @@ class AMTPredictor:
                 dt = datetime.fromisoformat(ct.replace('Z', ''))
                 hour_utc    = dt.hour
                 day_of_week = dt.weekday()
-        except Exception:
-            pass
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning(f"Failed to parse timestamp from signal: {e}")
 
         market_state = s.get('market_state', s.get('session_state', 'unknown'))
         signal_type = str(s.get('signal_type', 'unknown')).upper()
