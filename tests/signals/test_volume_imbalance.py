@@ -48,7 +48,7 @@ def test_cvd_divergence_bearish_mocked():
     assert result is not None
     assert result['signal_type'] == 'CVD_DIVERGENCE_EXHAUSTION'
     assert result['direction'] == 'SHORT'
-    assert result['trigger_price'] == 105.0
+    assert abs(result['trigger_price'] - 105.0) < 1e-9
 
 def test_cvd_divergence_bullish_mocked():
     # Bullish: price lower low, cvd higher low
@@ -77,7 +77,7 @@ def test_cvd_divergence_bullish_mocked():
     assert result is not None
     assert result['signal_type'] == 'CVD_DIVERGENCE_EXHAUSTION'
     assert result['direction'] == 'LONG'
-    assert result['trigger_price'] == 80.0
+    assert abs(result['trigger_price'] - 80.0) < 1e-9
 
 def test_aggression_spike_long_mocked():
     delta_series = MagicMock()
@@ -99,7 +99,7 @@ def test_aggression_spike_long_mocked():
     assert result is not None
     assert result['signal_type'] == 'DELTA_SPIKE'
     assert result['direction'] == 'LONG'
-    assert result['magnitude'] == 2.0 # 20.0 / 10.0
+    assert abs(result['magnitude'] - 2.0) < 1e-9 # 20.0 / 10.0
 
 def test_aggression_spike_short_mocked():
     delta_series = MagicMock()
@@ -121,7 +121,7 @@ def test_aggression_spike_short_mocked():
     assert result is not None
     assert result['signal_type'] == 'DELTA_SPIKE'
     assert result['direction'] == 'SHORT'
-    assert result['magnitude'] == 2.0
+    assert abs(result['magnitude'] - 2.0) < 1e-9
 
 def test_detect_cvd_divergence_no_divergence_mocked():
     # Price makes higher high, CVD ALSO makes higher high (no divergence)
