@@ -24,7 +24,6 @@ import os
 import sys
 from dataclasses import dataclass
 
-import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -108,7 +107,11 @@ def _load_evaluation_dataset(db_path: str):
     if len(df_raw) < 1000:
         print("⚠️  Small dataset; fold metrics may be noisy.")
 
-    xgb_enc = joblib.load(config.ML_ENCODERS_PATH) if os.path.exists(config.ML_ENCODERS_PATH) else None
+    if os.path.exists(config.ML_ENCODERS_PATH):
+        with open(config.ML_ENCODERS_PATH) as f:
+            xgb_enc = json.load(f)
+    else:
+        xgb_enc = None
     fit_new = xgb_enc is None
     df, _ = engineer_features(df_raw, encoders=xgb_enc, fit=fit_new)
     x = df[FEATURES].astype(float).values
@@ -221,9 +224,19 @@ def compare_models(
     regime_col = _select_regime_col(df)
 
     # Load trained artifacts
-    xgb_model = joblib.load(config.ML_MODEL_PATH)
-    mlp_payload = torch.load(config.ML_MLP_MODEL_PATH, map_location='cpu')
-    mlp_scaler = joblib.load(config.ML_MLP_SCALER_PATH)
+    import xgboost as xgb
+    xgb_model = xgb.XGBClassifier()
+    xgb_model.load_model(config.ML_MODEL_PATH)
+    mlp_payload = torch.load(config.ML_MLP_MODEL_PATH, map_location='cpu', weights_only=True)
+    with open(config.ML_MLP_SCALER_PATH) as f:
+        scaler_dict = json.load(f)
+    class SimpleScaler:
+        def __init__(self, mean, scale):
+            self.mean = np.array(mean, dtype=np.float32)
+            self.scale = np.array(scale, dtype=np.float32)
+        def transform(self, x):
+            return (x - self.mean) / self.scale
+    mlp_scaler = SimpleScaler(scaler_dict['mean'], scaler_dict['scale'])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

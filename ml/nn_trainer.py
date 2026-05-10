@@ -28,7 +28,6 @@ import os
 import sys
 from dataclasses import dataclass
 
-import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -271,8 +270,10 @@ def train(db_path: str = config.DB_PATH, cfg: NNTrainConfig | None = None):
         },
         config.ML_MLP_MODEL_PATH,
     )
-    joblib.dump(final_scaler, config.ML_MLP_SCALER_PATH)
-    joblib.dump(encoders, config.ML_MLP_ENCODERS_PATH)
+    with open(config.ML_MLP_SCALER_PATH, 'w') as f:
+        json.dump({'mean': final_scaler.mean_.tolist(), 'scale': final_scaler.scale_.tolist()}, f)
+    with open(config.ML_MLP_ENCODERS_PATH, 'w') as f:
+        json.dump({k: v.classes_.tolist() for k, v in encoders.items()}, f)
 
     meta = {
         'backend': 'mlp',

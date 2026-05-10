@@ -237,13 +237,21 @@ def engineer_features(df: pd.DataFrame, encoders: dict | None = None, fit: bool 
             df[enc_key] = pd.Series(le.fit_transform(df[col].astype(str)), index=df.index, name=enc_key)
             encoders[col] = le
         else:
-            le = encoders[col]
-            known = set(le.classes_)
-
-            def _encode_value(x: str, _le=le, _known=known) -> int:
-                return int(_le.transform([x])[0]) if x in _known else -1
-
-            df[enc_key] = df[col].astype(str).map(_encode_value)
+            le_or_list = encoders[col]
+            if isinstance(le_or_list, list):
+                # JSON loaded classes
+                def _encode_value(x: str, _classes=le_or_list) -> int:
+                    try:
+                        return _classes.index(x)
+                    except ValueError:
+                        return -1
+                df[enc_key] = df[col].astype(str).map(_encode_value)
+            else:
+                # Scikit-learn LabelEncoder
+                known = set(le_or_list.classes_)
+                def _encode_value(x: str, _le=le_or_list, _known=known) -> int:
+                    return int(_le.transform([x])[0]) if x in _known else -1
+                df[enc_key] = df[col].astype(str).map(_encode_value)
 
     # ── Target label ───────────────────────────────────────────────────────────
     loss_abs = pd.to_numeric(df['label_loss_pct'], errors='coerce').abs().replace(0, 1e-6)

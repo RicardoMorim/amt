@@ -16,7 +16,7 @@ Usage:
 import os, sys, json
 import numpy as np
 import pandas as pd
-import joblib
+import xgboost as xgb
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ml.dataset_builder import load_dataset, engineer_features, FEATURES
@@ -42,7 +42,11 @@ def evaluate(
         print("⚠️  Not enough data for evaluation.")
         return
 
-    encoders = joblib.load(encoders_path) if os.path.exists(encoders_path) else None
+    if os.path.exists(encoders_path):
+        with open(encoders_path) as f:
+            encoders = json.load(f)
+    else:
+        encoders = None
     df, _    = engineer_features(df_raw, encoders=encoders, fit=(encoders is None))
 
     split_idx = int(len(df) * (1 - holdout_frac))
@@ -57,7 +61,8 @@ def evaluate(
     X_hold = df_hold[FEATURES].astype(float)
     y_hold = df_hold['target']
 
-    model  = joblib.load(model_path)
+    model  = xgb.XGBClassifier()
+    model.load_model(model_path)
     probas = model.predict_proba(X_hold)[:, 1]
     preds  = (probas >= threshold).astype(int)
 
