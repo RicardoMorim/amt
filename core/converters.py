@@ -29,9 +29,10 @@ from .contracts import (
 def df_to_candles(df: pd.DataFrame, symbol: str = "", timeframe_secs: int = 60) -> List[Candle]:
     """Convert an OHLCV DataFrame to a list of Candle objects."""
     candles = []
-    for row in df.to_dict('records'):
+    for row in df.itertuples(index=False):
+        row_dict = row._asdict()
         try:
-            candle = Candle.from_pandas_row(row, symbol=symbol, timeframe_secs=timeframe_secs)
+            candle = Candle.from_pandas_row(row_dict, symbol=symbol, timeframe_secs=timeframe_secs)
             candles.append(candle)
         except (KeyError, ValueError, TypeError):
             # Skip malformed rows silently — caller can inspect later
@@ -42,9 +43,10 @@ def df_to_candles(df: pd.DataFrame, symbol: str = "", timeframe_secs: int = 60) 
 def df_to_signals(df: pd.DataFrame) -> List[AMTSignal]:
     """Convert a DataFrame of signal records to AMTSignal objects."""
     signals = []
-    for row in df.to_dict('records'):
+    for row in df.itertuples(index=False):
+        row_dict = row._asdict()
         try:
-            sig = AMTSignal.from_legacy_dict(row)
+            sig = AMTSignal.from_legacy_dict(row_dict)
             signals.append(sig)
         except Exception:
             continue
@@ -54,9 +56,9 @@ def df_to_signals(df: pd.DataFrame) -> List[AMTSignal]:
 def df_to_predictions(df: pd.DataFrame) -> List[KronosPrediction]:
     """Convert a DataFrame of prediction records to KronosPrediction objects."""
     preds = []
-    for d in df.to_dict('records'):
+    for row in df.itertuples(index=False):
         try:
-            preds.append(KronosPrediction.from_dict(d))
+            preds.append(KronosPrediction.from_dict(row._asdict()))
         except Exception:
             continue
     return preds
