@@ -1,7 +1,6 @@
 import pytest
 import sqlite3
 import pandas as pd
-from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 from data.ml_collector import MLDataCollector
 
@@ -56,7 +55,7 @@ def test_flush_buffer(collector):
 
 def test_label_all_pending(collector):
     sig_long = {'id': 'sig_l', 'timestamp_event': '2023-01-01T00:00:00Z', 'direction': 'LONG', 'trigger_price': 100.0}
-    sig_short = {'id': 'sig_s', 'timestamp_event': '2023-01-01T00:10:00Z', 'direction': 'SHORT', 'trigger_price': 200.0}
+    sig_short = {'id': 'sig_s', 'timestamp_event': '2023-01-01T00:16:00Z', 'direction': 'SHORT', 'trigger_price': 200.0}
 
     collector.insert_signal(sig_long)
     collector.insert_signal(sig_short)
@@ -65,10 +64,10 @@ def test_label_all_pending(collector):
     is_pandas_mocked = not hasattr(pd, '__version__') or isinstance(pd, MagicMock)
 
     if not is_pandas_mocked:
-        index = pd.date_range("2023-01-01 00:00:00", periods=30, freq="1min")
+        index = pd.date_range("2023-01-01 00:00:00", periods=30, freq="min", tz="UTC")
         df = pd.DataFrame(index=index)
-        df['high'] = [110 if i < 10 else 220 for i in range(30)]
-        df['low'] = [90 if i < 10 else 180 for i in range(30)]
+        df['high'] = [110 if i <= 15 else 220 for i in range(30)]
+        df['low'] = [90 if i <= 15 else 180 for i in range(30)]
 
         collector.label_all_pending(df)
 
@@ -82,13 +81,13 @@ def test_label_all_pending(collector):
             if r[0] == 'sig_l':
                 assert r[2] == 110.0
                 assert r[3] == 90.0
-                assert pytest.approx(r[4]) == 0.1
-                assert pytest.approx(r[5]) == -0.1
+                assert abs(r[4] - 0.1) < 1e-6
+                assert abs(r[5] - (-0.1)) < 1e-6
             elif r[0] == 'sig_s':
                 assert r[2] == 220.0
                 assert r[3] == 180.0
-                assert pytest.approx(r[4]) == 0.1
-                assert pytest.approx(r[5]) == -0.1
+                assert abs(r[4] - 0.1) < 1e-6
+                assert abs(r[5] - (-0.1)) < 1e-6
     else:
         # Instead of failing with complicated pandas mock logic, we'll verify it returns safely if no pandas df.
         df_empty = MagicMock()
