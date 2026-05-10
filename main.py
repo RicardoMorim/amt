@@ -194,8 +194,8 @@ class AMTSession:
             for i, c in enumerate(self._candle_deque):
                 c['cvd'] = float(df['cvd'].iloc[i])
 
-            for _, c in df.iloc[-20:].iterrows():
-                self.profile_mgr.update(price=c['close'], volume=c['volume'])
+            for c in df.iloc[-20:].itertuples():
+                self.profile_mgr.update(price=c.close, volume=c.volume)
 
             logger.info(f"[{self.symbol}] ✅ Histórico carregado.")
         except Exception as e:
