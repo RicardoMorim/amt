@@ -42,9 +42,9 @@ def df_to_candles(df: pd.DataFrame, symbol: str = "", timeframe_secs: int = 60) 
 def df_to_signals(df: pd.DataFrame) -> List[AMTSignal]:
     """Convert a DataFrame of signal records to AMTSignal objects."""
     signals = []
-    for row in df.to_dict('records'):
+    for row in df.itertuples(index=False):
         try:
-            sig = AMTSignal.from_legacy_dict(row)
+            sig = AMTSignal.from_legacy_dict(row._asdict())
             signals.append(sig)
         except Exception:
             continue
