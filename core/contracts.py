@@ -28,7 +28,7 @@ class Direction(str, Enum):
 
     @classmethod
     def from_raw(cls, value: Any) -> "Direction":
-        """Normaliza valores brutos para Direction."""
+        """Normaliza valores brutos para Direction. Raises ValueError on unknown values."""
         if isinstance(value, cls):
             return value
         s = str(value).upper().strip()
@@ -43,7 +43,12 @@ class Direction(str, Enum):
             "HOLD": cls.FLAT,
             "0": cls.FLAT,
         }
-        return mapping.get(s, cls.FLAT)
+        if s not in mapping:
+            raise ValueError(
+                f"Unknown Direction value: {value!r}. "
+                f"Valid values: {sorted(mapping.keys())}"
+            )
+        return mapping[s]
 
 
 class MarketState(str, Enum):
@@ -63,7 +68,12 @@ class MarketState(str, Enum):
             "IMBALANCE_DOWN": cls.IMBALANCE_DOWN,
             "UNKNOWN": cls.UNKNOWN,
         }
-        return mapping.get(s, cls.UNKNOWN)
+        if s not in mapping:
+            raise ValueError(
+                f"Unknown MarketState value: {value!r}. "
+                f"Valid values: {sorted(mapping.keys())}"
+            )
+        return mapping[s]
 
 
 class SignalType(str, Enum):
@@ -73,6 +83,11 @@ class SignalType(str, Enum):
     CVD_DIVERGENCE = "CVD_DIVERGENCE"
     KRONOS_PREDICTION = "KRONOS_PREDICTION"
     FUSION_DECISION = "FUSION_DECISION"
+    INITIATIVE_BREAKOUT = "INITIATIVE_BREAKOUT"
+    DELTA_SPIKE = "DELTA_SPIKE"
+    CVD_DIVERGENCE_EXHAUSTION = "CVD_DIVERGENCE_EXHAUSTION"
+    EXCESS = "EXCESS"
+    RESPONSIVE_ACTIVITY = "RESPONSIVE_ACTIVITY"
 
     @classmethod
     def from_raw(cls, value: Any) -> "SignalType":
@@ -80,8 +95,12 @@ class SignalType(str, Enum):
             return value
         s = str(value).upper().strip()
         mapping = {st.value: st for st in cls}
-        # Fallback: try direct match too
-        return mapping.get(s, cls.FUSION_DECISION)
+        if s not in mapping:
+            raise ValueError(
+                f"Unknown SignalType value: {value!r}. "
+                f"Valid values: {sorted(mapping.keys())}"
+            )
+        return mapping[s]
 
 
 class SessionState(str, Enum):
@@ -99,7 +118,12 @@ class SessionState(str, Enum):
             return value
         s = str(value).upper().strip()
         mapping = {ss.value: ss for ss in cls}
-        return mapping.get(s, cls.UNKNOWN)
+        if s not in mapping:
+            raise ValueError(
+                f"Unknown SessionState value: {value!r}. "
+                f"Valid values: {sorted(mapping.keys())}"
+            )
+        return mapping[s]
 
 
 class TradeAction(str, Enum):
@@ -115,13 +139,18 @@ class TradeAction(str, Enum):
             return value
         s = str(value).upper().strip()
         mapping = {ta.value: ta for ta in cls}
-        # Alias support
         alias_map = {
             "LONG": cls.BUY,
             "SHORT": cls.SELL,
             "FLAT": cls.HOLD,
         }
-        return mapping.get(s, alias_map.get(s, cls.HOLD))
+        merged = {**alias_map, **mapping}
+        if s not in merged:
+            raise ValueError(
+                f"Unknown TradeAction value: {value!r}. "
+                f"Valid values: {sorted(merged.keys())}"
+            )
+        return merged[s]
 
 
 # ---------------------------------------------------------------------------
@@ -172,13 +201,16 @@ class Candle:
     def from_pandas_row(cls, row: Any, symbol: str = "", timeframe_secs: int = 60) -> "Candle":
         """Create a Candle from a pandas Series / dict-like row."""
         ts_raw = row.get("timestamp", row.get("time", row.get("date", None)))
+        if ts_raw is None:
+            raise ValueError("Row has no timestamp/time/date field")
         if isinstance(ts_raw, (int, float)):
-            # Unix timestamp in seconds
             ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
         elif isinstance(ts_raw, str):
             ts = _iso_to_dt(ts_raw)
+        elif isinstance(ts_raw, datetime):
+            ts = ts_raw if ts_raw.tzinfo else ts_raw.replace(tzinfo=timezone.utc)
         else:
-            ts = datetime.now(tz=timezone.utc)
+            raise TypeError(f"Unrecognized timestamp type: {type(ts_raw).__name__}")
 
         return cls(
             symbol=symbol or str(row.get("symbol", "UNKNOWN")),
@@ -240,7 +272,7 @@ class CandleWindow:
     @classmethod
     def from_candles(cls, candles: List[Candle]) -> "CandleWindow":
         if not candles:
-            return cls(symbol=candles[0].symbol if candles else "")
+            raise ValueError("Cannot create CandleWindow from an empty list")
         symbol = candles[0].symbol
         tf = candles[0].timeframe_secs
         return cls(
@@ -303,17 +335,20 @@ class AMTContextSnapshot:
         )
 
     @classmethod
-    def from_volume_profile(cls, symbol: str, profile_data: Optional[Dict[str, Any]],
+    def from_volume_profile(cls, symbol: str, profile_data: Dict[str, Any],
                             current_price: float = 0.0) -> "AMTContextSnapshot":
-        """Adapt old volume_profile.py output into the new contract."""
+        """Adapt volume_profile.py output into the new contract."""
         if not profile_data:
-            return cls(symbol=symbol)
+            raise ValueError("profile_data is required and cannot be None or empty")
 
-        poc = float(profile_data.get("poc", 0))
-        vah = float(profile_data.get("vah", 0))
-        val = float(profile_data.get("val", 0))
+        poc = float(profile_data['poc'])
+        vah = float(profile_data['vah'])
+        val = float(profile_data['val'])
 
-        dist_poc_pct = ((current_price - poc) / poc * 100) if poc else 0.0
+        if poc <= 0:
+            raise ValueError(f"poc must be positive, got {poc}")
+
+        dist_poc_pct = (current_price - poc) / poc * 100
 
         return cls(
             symbol=symbol,
@@ -372,10 +407,10 @@ class AMTSignal:
     def from_dict(cls, data: Dict[str, Any]) -> "AMTSignal":
         return cls(
             symbol=str(data["symbol"]),
-            timestamp_event=_iso_to_dt(data.get("timestamp_event")),
-            direction=Direction.from_raw(data.get("direction", "FLAT")),
-            signal_type=SignalType.from_raw(data.get("signal_type")),
-            session_state=SessionState.from_raw(data.get("session_state")),
+            timestamp_event=_iso_to_dt(data["timestamp_event"]),
+            direction=Direction.from_raw(data["direction"]),
+            signal_type=SignalType.from_raw(data.get("signal_type", "FUSION_DECISION")),
+            session_state=SessionState.from_raw(data.get("session_state", "UNKNOWN")),
             is_composite=bool(data.get("is_composite", False)),
             confidence=float(data.get("confidence", 0.5)),
             probability=float(data.get("probability", 0.0)),
@@ -395,7 +430,7 @@ class AMTSignal:
             timestamp_event=_iso_to_dt(data.get("timestamp_event", data.get("timestamp", datetime.now(tz=timezone.utc)))),
             direction=Direction.from_raw(data.get("direction", data.get("side", "FLAT"))),
             signal_type=SignalType.from_raw(data.get("signal_type", data.get("type", "FUSION_DECISION"))),
-            session_state=SessionState.from_raw(data.get("session_state")),
+            session_state=SessionState.from_raw(data.get("session_state", "UNKNOWN")),
             is_composite=bool(data.get("is_composite", False)),
             confidence=float(data.get("confidence", 0.5)),
             probability=float(data.get("probability", float(data.get("prob", 0.0)))),
@@ -415,11 +450,9 @@ class KronosPrediction:
     direction: Direction
     confidence: float = 0.5  # [0, 1]
 
-    # Optional: raw logits / probabilities per class
     probability_long: float = 0.0
     probability_short: float = 0.0
 
-    # Context used for the prediction (for audit trail)
     context_length: int = 0
     timeframe_secs: int = 60
 
@@ -457,15 +490,13 @@ class FusionDecision:
     action: TradeAction
     direction: Direction = Direction.FLAT
 
-    # Scores from each source
-    amt_score: float = 0.0       # [-1, 1] or [0, 1]
-    kronos_score: float = 0.0    # [-1, 1] or [0, 1]
-    fusion_score: float = 0.0    # weighted composite
+    amt_score: float = 0.0
+    kronos_score: float = 0.0
+    fusion_score: float = 0.0
 
-    confidence: float = 0.5      # [0, 1] overall confidence
-    probability: float = 0.0     # [0, 1] estimated win rate
+    confidence: float = 0.5
+    probability: float = 0.0
 
-    # Which signals contributed (for audit)
     contributing_signals: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -540,7 +571,7 @@ class TradeLabel:
 
 
 # ---------------------------------------------------------------------------
-# Type aliases for convenience
+# Type aliases
 # ---------------------------------------------------------------------------
 
 Contract = Candle | AMTSignal | KronosPrediction | FusionDecision | TradeLabel
@@ -555,28 +586,38 @@ def _dt_to_iso(dt: Optional[datetime]) -> str:
     """Convert datetime to ISO-8601 UTC string."""
     if dt is None:
         return ""
-    # Ensure UTC
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat()
 
 
 def _iso_to_dt(iso_str: Any) -> datetime:
-    """Parse ISO-8601 string to UTC datetime."""
+    """
+    Parse ISO-8601 string to UTC datetime.
+    Raises:
+        TypeError: if iso_str is not a string or datetime.
+        ValueError: if the string is not a valid ISO-8601 timestamp.
+    """
     if isinstance(iso_str, datetime):
         return iso_str.replace(tzinfo=timezone.utc) if iso_str.tzinfo is None else iso_str
-    s = str(iso_str).strip()
-    # Handle 'Z' suffix
+    if not isinstance(iso_str, str):
+        raise TypeError(f"Expected a string or datetime for ISO timestamp, got {type(iso_str).__name__}: {iso_str!r}")
+    s = iso_str.strip()
+    if not s:
+        raise ValueError("Timestamp string is empty")
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"Invalid ISO timestamp: {iso_str!r} — {exc}") from exc
 
 
 def _market_state_from_price(price: float, poc: float, vah: float, val: float) -> MarketState:
     """Recreate market state logic from core/market_state.py."""
     if not poc or not vah or not val:
         return MarketState.UNKNOWN
-    buffer = 0.01 / 100  # 0.01%
+    buffer = 0.01 / 100
     upper = vah * (1 + buffer)
     lower = val * (1 - buffer)
     if price > upper:
@@ -620,9 +661,5 @@ def contracts_from_json(json_str: str) -> List[Contract]:
         elif "closes" in item or "opens" in item:
             result.append(CandleWindow.from_dict(item))
         else:
-            # Try Candle first, then fallback to dict
-            try:
-                result.append(Candle.from_dict(item))
-            except (KeyError, TypeError):
-                result.append(cast(Contract, item))  # type: ignore[assignment]
+            result.append(Candle.from_dict(item))
     return result
