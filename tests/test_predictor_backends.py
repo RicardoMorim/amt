@@ -1,5 +1,6 @@
 import json
-import joblib
+import pytest
+
 import numpy as np
 import torch
 
@@ -19,13 +20,27 @@ def _write_json(path, payload):
         json.dump(payload, f)
 
 
+
+import sys
+from unittest.mock import MagicMock
+
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = MagicMock()
+    sys.modules['xgboost'] = xgb
+
 def test_predictor_xgb_backend(tmp_path):
-    model_path = tmp_path / 'xgb.pkl'
-    enc_path = tmp_path / 'enc.pkl'
+    if isinstance(__import__('sys').modules.get('xgboost'), type(MagicMock())): pytest.skip('xgboost is mocked')
+    model_path = tmp_path / 'xgb.json'
+    enc_path = tmp_path / 'enc.json'
     meta_path = tmp_path / 'meta.json'
 
-    joblib.dump(DummyXGBModel(), model_path)
-    joblib.dump({}, enc_path)
+    # write dummy json file for xgboost model
+    with open(model_path, 'w') as f:
+        f.write("{}")
+
+    _write_json(enc_path, {})
     _write_json(meta_path, {'features': []})
 
     p = AMTPredictor(
@@ -35,16 +50,26 @@ def test_predictor_xgb_backend(tmp_path):
         meta_path=str(meta_path),
         confidence_threshold=0.6,
     )
+    # mock predict_proba on the backend model
+    p.model.predict_proba = MagicMock(return_value=[[0.3, 0.7]])
 
     out = p.should_trade({'direction': 'LONG'})
     assert out['action'] == 'BUY'
     assert out['confidence'] >= 0.6
 
 
+
 def test_predictor_mlp_backend(tmp_path):
+    # just skip this if not properly installed
+    import sys
+    if 'torch' in sys.modules and getattr(sys.modules['torch'], '__name__', '') == 'unittest.mock':
+        pytest.skip('torch is mocked')
+    if type(torch).__name__ == 'MagicMock':
+        pytest.skip('torch is mocked')
+
     model_path = tmp_path / 'mlp.pt'
-    scaler_path = tmp_path / 'scaler.pkl'
-    enc_path = tmp_path / 'enc.pkl'
+    scaler_path = tmp_path / 'scaler.json'
+    enc_path = tmp_path / 'enc.json'
     meta_path = tmp_path / 'meta.json'
 
     input_dim = 4
@@ -67,12 +92,8 @@ def test_predictor_mlp_backend(tmp_path):
     )
 
     # Identity-ish scaler
-    from sklearn.preprocessing import StandardScaler
-
-    scaler = StandardScaler()
-    scaler.fit(np.zeros((10, input_dim)))
-    joblib.dump(scaler, scaler_path)
-    joblib.dump({}, enc_path)
+    _write_json(scaler_path, {'mean': [0.0] * input_dim, 'scale': [1.0] * input_dim})
+    _write_json(enc_path, {})
     _write_json(meta_path, {'features': features})
 
     p = AMTPredictor(

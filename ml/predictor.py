@@ -20,7 +20,6 @@ from __future__ import annotations
 import sys
 import json
 import os
-import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -54,12 +53,14 @@ class _TabularMLP(nn.Module):
 class AMTPredictor:
 
     def _init_xgb_backend(self, model_path: str):
-        self.model = joblib.load(model_path)
+        import xgboost as xgb
+        self.model = xgb.XGBClassifier()
+        self.model.load_model(model_path)
         self.scaler = None
         self.device = None
 
     def _init_mlp_backend(self, model_path: str, scaler_path: str | None):
-        payload = torch.load(model_path, map_location='cpu')
+        payload = torch.load(model_path, map_location='cpu', weights_only=True)
         input_dim = int(payload['input_dim'])
         hidden_dims = tuple(payload.get('hidden_dims', [64, 32]))
         dropout = float(payload.get('dropout', 0.20))
@@ -68,7 +69,18 @@ class AMTPredictor:
         self.model = _TabularMLP(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout).to(self.device)
         self.model.load_state_dict(payload['state_dict'])
         self.model.eval()
-        self.scaler = joblib.load(scaler_path) if scaler_path and os.path.exists(scaler_path) else None
+
+        self.scaler = None
+        if scaler_path and os.path.exists(scaler_path):
+            with open(scaler_path) as f:
+                scaler_dict = json.load(f)
+            class SimpleScaler:
+                def __init__(self, mean, scale):
+                    self.mean = np.array(mean, dtype=np.float32)
+                    self.scale = np.array(scale, dtype=np.float32)
+                def transform(self, x):
+                    return (x - self.mean) / self.scale
+            self.scaler = SimpleScaler(scaler_dict['mean'], scaler_dict['scale'])
 
     def __init__(
         self,
@@ -99,7 +111,8 @@ class AMTPredictor:
 
         # B2 — load serialised encoders (same mapping as training)
         if encoders_path and os.path.exists(encoders_path):
-            self.encoders = joblib.load(encoders_path)
+            with open(encoders_path) as f:
+                self.encoders = json.load(f)
         else:
             self.encoders = {}
 
@@ -152,14 +165,15 @@ class AMTPredictor:
     # ── Internal ───────────────────────────────────────────────────────────────
 
     def _encode_cat(self, col: str, value: str) -> int:
-        """Encode using saved LabelEncoder; unknown values → -1."""
-        le = self.encoders.get(col)
-        if le is None:
+        """Encode using saved mapping; unknown values → -1."""
+        classes = self.encoders.get(col)
+        if classes is None:
             return -1
         v = str(value)
-        if v in set(le.classes_):
-            return int(le.transform([v])[0])
-        return -1
+        try:
+            return classes.index(v)
+        except ValueError:
+            return -1
 
     def _build_feature_vector(self, s: dict) -> list:
         direction = str(s.get('direction', 'LONG')).upper()

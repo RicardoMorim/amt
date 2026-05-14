@@ -20,7 +20,6 @@ import os
 import sys
 import json
 import argparse
-import joblib
 import numpy as np
 import xgboost as xgb
 from sklearn.metrics import classification_report, roc_auc_score
@@ -207,8 +206,9 @@ def train(db_path: str = config.DB_PATH, drop_hour_utc: bool = False):
 
     # ── Save model + encoders + metadata ─────────────────────────────────────
     os.makedirs('ml', exist_ok=True)
-    joblib.dump(final_model, MODEL_PATH)
-    joblib.dump(encoders,    ENCODERS_PATH)
+    final_model.save_model(MODEL_PATH)
+    with open(ENCODERS_PATH, 'w') as f:
+        json.dump({k: v.classes_.tolist() for k, v in encoders.items()}, f)
 
     meta = {
         'features':        feature_cols,
