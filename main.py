@@ -443,12 +443,6 @@ class AMTSession:
         except Exception as e:
             logger.error(f"[{self.symbol}] Falha na Arbitragem: {e}")
 
-        if is_closed:
-            self.ml_collector.update_labels(
-                current_time_iso=context['candle_time'],
-                current_price=trigger_price,
-                history_df=working_history,
-            )
 
 
 class AMTEngineManager:

@@ -182,10 +182,6 @@ class MLDataCollector:
             self.conn.commit()
             logging.info(f"[MLDataCollector] 🏷️ Labeled {len(updates)} signals in bulk.")
 
-    def update_labels(self, current_time_iso: str, current_price: float, history_df: pd.DataFrame):
-        """Legacy no-op kept for live-bot compatibility."""
-        pass
-
     def close(self):
         self._flush_buffer()
         if self._owns_connection:
