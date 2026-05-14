@@ -203,15 +203,22 @@ class AMTSession:
 
     # ── Core trade pipeline ───────────────────────────────────────────────────
 
-    def on_trade(self, trade: dict):
-        price  = float(trade['price'])
-        volume = float(trade['volume'])
-        side   = trade.get('side')
+    def on_trade(self, trade):
+        if isinstance(trade, dict):
+            price  = float(trade['price'])
+            volume = float(trade['volume'])
+            side   = trade.get('side')
+            trade_timestamp = trade['timestamp']
+        else:
+            price  = float(trade.price)
+            volume = float(trade.volume)
+            side   = getattr(trade, 'side', None)
+            trade_timestamp = trade.timestamp
 
         self.profile_mgr.update(price=price, volume=volume)
 
         # A3 — normalise timestamp
-        trade_dt   = _to_naive_utc(trade['timestamp'])
+        trade_dt   = _to_naive_utc(trade_timestamp)
         trade_date = trade_dt.strftime('%Y-%m-%d')
 
         if self._current_session_date is None:
