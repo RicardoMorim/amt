@@ -333,10 +333,10 @@ def _upsert_candles(
         return
 
     rows = []
-    for ts, row in ohlcv_df.iterrows():
-        if pd.isna(row.get('open')) or pd.isna(row.get('high')) or pd.isna(row.get('low')) or pd.isna(row.get('close')):
+    for row in ohlcv_df.itertuples():
+        if pd.isna(getattr(row, 'open', None)) or pd.isna(getattr(row, 'high', None)) or pd.isna(getattr(row, 'low', None)) or pd.isna(getattr(row, 'close', None)):
             continue
-        ts_dt = pd.Timestamp(ts)
+        ts_dt = pd.Timestamp(row.Index)
         if ts_dt.tzinfo is None:
             ts_iso = ts_dt.tz_localize('UTC').isoformat()
         else:
@@ -345,11 +345,11 @@ def _upsert_candles(
             str(symbol).lower(),
             int(timeframe_secs),
             ts_iso,
-            float(row['open']),
-            float(row['high']),
-            float(row['low']),
-            float(row['close']),
-            float(row.get('volume', 0.0) or 0.0),
+            float(row.open),
+            float(row.high),
+            float(row.low),
+            float(row.close),
+            float(getattr(row, 'volume', 0.0) or 0.0),
         ))
 
     if not rows:
