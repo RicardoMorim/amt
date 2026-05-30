@@ -33,7 +33,6 @@ from core.contracts import (
     Direction,
     SignalType,
     SessionState,
-    MarketState,
     contracts_to_json,
     contracts_from_json,
 )
