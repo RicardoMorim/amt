@@ -247,15 +247,18 @@ def _aggregate_by_seconds(df: pd.DataFrame, secs: int) -> pd.DataFrame:
     total_volume   = df['volume'].resample(rule).sum()
     vwap           = weighted_price / total_volume
 
-    # Fix: compute buy/sell volume on the full resampled index to avoid
+    # Compute buy and sell volume on the full resampled index to avoid
     # misaligned-Series errors when one side has zero trades in a bucket.
-    buy_vol  = df.loc[df['side'] == 'buy', 'volume'].resample(rule).sum()
-    sell_vol = df.loc[df['side'] == 'sell', 'volume'].resample(rule).sum()
+    # Vectorized approach resamples both sides at once for better efficiency.
+    vols = df.assign(
+        buy_v=np.where(df['side'] == 'buy', df['volume'], 0.0),
+        sell_v=np.where(df['side'] == 'sell', df['volume'], 0.0)
+    ).resample(rule)[['buy_v', 'sell_v']].sum()
 
-    # Reindex both to the full resampled index so they share identical labels
     idx = weighted_price.index
-    buy_vol  = buy_vol.reindex(idx, fill_value=0.0)
-    sell_vol = sell_vol.reindex(idx, fill_value=0.0)
+    vols = vols.reindex(idx, fill_value=0.0)
+    buy_vol  = vols['buy_v']
+    sell_vol = vols['sell_v']
 
     dominant_side = pd.Series(
         np.where(buy_vol >= sell_vol, 'buy', 'sell'),
